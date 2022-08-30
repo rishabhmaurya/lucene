@@ -28,15 +28,15 @@ import org.apache.lucene.util.PagedBytes;
 
 /** Buffers up pending byte[][] value(s) per doc, then flushes when segment flushes. */
 class PointValuesWriter {
-  private final FieldInfo fieldInfo;
-  private final PagedBytes bytes;
+  protected final FieldInfo fieldInfo;
+  protected final PagedBytes bytes;
   private final DataOutput bytesOut;
-  private final Counter iwBytesUsed;
-  private int[] docIDs;
-  private int numPoints;
+  protected final Counter iwBytesUsed;
+  protected int[] docIDs;
+  protected int numPoints;
   private int numDocs;
   private int lastDocID = -1;
-  private final int packedBytesLength;
+  protected final int packedBytesLength;
 
   PointValuesWriter(Counter bytesUsed, FieldInfo fieldInfo) {
     this.fieldInfo = fieldInfo;

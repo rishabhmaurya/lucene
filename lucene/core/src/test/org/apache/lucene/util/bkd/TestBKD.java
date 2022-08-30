@@ -24,17 +24,15 @@ import java.util.BitSet;
 import java.util.List;
 import java.util.Random;
 import org.apache.lucene.codecs.MutablePointTree;
+import org.apache.lucene.codecs.MutableSummaryPointTree;
+import org.apache.lucene.document.TSPointQuery;
 import org.apache.lucene.index.CorruptIndexException;
 import org.apache.lucene.index.MergeState;
 import org.apache.lucene.index.PointValues;
 import org.apache.lucene.index.PointValues.IntersectVisitor;
 import org.apache.lucene.index.PointValues.Relation;
 import org.apache.lucene.search.DocIdSetIterator;
-import org.apache.lucene.store.Directory;
-import org.apache.lucene.store.FilterDirectory;
-import org.apache.lucene.store.IOContext;
-import org.apache.lucene.store.IndexInput;
-import org.apache.lucene.store.IndexOutput;
+import org.apache.lucene.store.*;
 import org.apache.lucene.tests.mockfile.ExtrasFS;
 import org.apache.lucene.tests.store.CorruptingIndexOutput;
 import org.apache.lucene.tests.store.MockDirectoryWrapper;
@@ -44,6 +42,7 @@ import org.apache.lucene.util.BytesRef;
 import org.apache.lucene.util.IOUtils;
 import org.apache.lucene.util.NumericUtils;
 
+@LuceneTestCase.SuppressSysoutChecks(bugUrl = "test bkd")
 public class TestBKD extends LuceneTestCase {
 
   protected PointValues getPointValues(IndexInput in) throws IOException {
@@ -1751,5 +1750,276 @@ public class TestBKD extends LuceneTestCase {
       w.close();
     }
     dir.close();
+  }
+
+  public void testPointsWithSummary() throws Exception {
+    int tt = 1;
+    //BKDSummaryWriter.SummaryMergeFunction<Long> maxFunction = new LongMaxFunction();
+    BKDSummaryWriter.SummaryMergeFunction<Integer> countFunction = new CountFunction();
+    while(tt-- > 0) {
+      Directory dir = newMockFSDirectory(createTempDir("TestPointsWithSummary"));
+      // final int numValues = 5;
+      final int numValues = 10000; //random().nextInt(1,10000000);
+      final int numBytesPerDim = 4;
+      final int numBytesSummary = countFunction.getSummarySize();
+      final byte[] pointValue = new byte[numBytesPerDim];
+      byte[] summaryValue = new byte[numBytesSummary];
+
+      // PagedBytes bytes = new PagedBytes(12);
+      // DataOutput bytesOut = bytes.getDataOutput();
+
+      // PagedBytes summaryBytes = new PagedBytes(12);
+      // DataOutput summaryBytesOut = summaryBytes.getDataOutput();
+
+      int maxPointsInLeaf = 1000;//random().nextInt(1, Math.max(2, numValues));
+      System.out.println(maxPointsInLeaf);
+      BKDSummaryWriter w =
+              new BKDSummaryWriter(
+                      numValues,
+                      dir,
+                      "_temp",
+                      new BKDConfig(1, 1, numBytesPerDim, maxPointsInLeaf),
+                      BKDWriter.DEFAULT_MAX_MB_SORT_IN_HEAP,
+                      numValues);
+
+      int expectedMax = Integer.MIN_VALUE;
+      byte[] expectedLowerPoint = new byte[numBytesPerDim];
+      byte[] expectedUpperPoint = new byte[numBytesPerDim];
+      int expectedCount = 0;
+      int expectedLP = random().nextInt(0, numValues);
+      int expectedUP = random().nextInt(expectedLP+1, numValues+2);
+
+      System.out.println(expectedLP + " " + expectedUP);
+      NumericUtils.intToSortableBytes(expectedLP, expectedLowerPoint, 0);
+      NumericUtils.intToSortableBytes(expectedUP, expectedUpperPoint, 0);
+      // int[] inp = {3,2,5,7,8,0,1,6,2};
+      for (int i = 0; i < numValues; i++) {
+        // random().nextBytes(pointValue);
+        // NumericUtils.intToSortableBytes(inp[i], pointValue, 0);
+        // int pv = inp[i]; // Math.abs(random().nextInt(numValues));
+        int pv = i; // Math.abs(random().nextInt(0, numValues));
+        NumericUtils.intToSortableBytes(pv, pointValue, 0);
+        // System.out.print(pv + " ");
+        int summaryMetric = i;
+        // bytesOut.writeBytes(pointValue, 0, numBytesPerDim);
+        //summaryBytesOut.writeBytes(summaryValue, 0, numBytesSummary);
+        if (pv >= expectedLP && pv <= expectedUP) {
+          expectedMax = Math.max(expectedMax, summaryMetric);
+          expectedCount++;
+        }
+      }
+
+      // final PagedBytes.Reader bytesReader = bytes.freeze(false);
+      // final PagedBytes.Reader sumaryBytesReader = summaryBytes.freeze(false);
+
+      MutableSummaryPointTree points =
+              new MutableSummaryPointTree() {
+                /*
+                final int[] ords = new int[numValues];
+                int[] temp;
+
+                {
+                  for (int i = 0; i < numValues; ++i) {
+                    ords[i] = i;
+                  }
+                }
+                */
+                @Override
+                public long size() {
+                  return numValues;
+                }
+
+                @Override
+                public void visitDocValues(PointValues.IntersectVisitor visitor) throws IOException {
+                  final BytesRef scratch = new BytesRef();
+                  final byte[] packedValue = new byte[numBytesPerDim];
+
+                  //final BytesRef summaryScratch = new BytesRef();
+                  //final byte[] packedSummaryValue = new byte[numBytesSummary];
+                  byte[] summaryScratch = new byte[numBytesSummary];
+                  for (int i = 0; i < numValues; i++) {
+                    getValue(i, scratch);
+                    // assert scratch.length == packedValue.length;
+                    System.arraycopy(scratch.bytes, 0, packedValue, 0, numBytesPerDim);
+                    // visitor.visit(getDocID(i), packedValue);
+
+                    // final long offset = (long) numBytesSummary * ords[i];
+                    // final long offset = (long) numBytesSummary * i;
+                    //int pv = i; // Math.abs(random().nextInt(0, numValues));
+                    // NumericUtils.intToSortableBytes(pv, pointValue, 0);
+                    // System.out.print(pv + " ");
+                    int summaryMetric = i;
+                    /// sumaryBytesReader.fillSlice(summaryScratch, offset, numBytesSummary);
+                    // System.arraycopy(summaryScratch.bytes, summaryScratch.offset, packedSummaryValue, 0,
+                    //       numBytesSummary);
+
+                    countFunction.packBytes(1, summaryScratch);
+                    visitor.visit(getDocID(i), packedValue, summaryScratch);
+                  }
+                }
+
+                @Override
+                public void swap(int i, int j) {
+                  throw new UnsupportedOperationException("Input already sorted, swap shouldn't be called.");
+                  /*
+                  int tmp = ords[i];
+                  ords[i] = ords[j];
+                  ords[j] = tmp;*/
+                }
+
+                @Override
+                public int getDocID(int i) {
+                  return i;
+                  // return docIDs.get(); docId[ords[i]];
+                }
+
+                @Override
+                public void getValue(int i, BytesRef packedValue) {
+                  // final long offset = (long) numBytesPerDim * ords[i];
+                  //final long offset = (long) numBytesPerDim * i;
+                  NumericUtils.intToSortableBytes(i, pointValue, 0);
+                  packedValue.bytes = pointValue;
+                  packedValue.offset = 0;
+                  packedValue.length = numBytesPerDim;
+                  //bytesReader.fillSlice(packedValue, offset, numBytesPerDim);
+                }
+
+                @Override
+                public byte getByteAt(int i, int k) {
+                  // final long offset = (long) numBytesPerDim * ords[i] + k;
+                  // final long offset = (long) numBytesPerDim * i + k;
+                  NumericUtils.intToSortableBytes(i, pointValue, 0);
+                  return pointValue[k];
+                }
+
+                @Override
+                public void save(int i, int j) {
+                  // throw new UnsupportedOperationException("Input already sorted, save() shouldn't be called");
+                  /*
+                  if (temp == null) {
+                    temp = new int[ords.length];
+                  }
+                  temp[j] = ords[i];
+
+                   */
+                }
+
+                @Override
+                public void restore(int i, int j) {
+                  // throw new UnsupportedOperationException("Input already sorted, save() shouldn't be called");
+                  /*
+                  if (temp != null) {
+                    System.arraycopy(temp, i, ords, i, j - i);
+                  }
+
+                   */
+                }
+              };
+
+      try (IndexOutput metaOut = dir.createOutput("bkdm", IOContext.DEFAULT);
+           IndexOutput indexOut = dir.createOutput("bkdi", IOContext.DEFAULT);
+           IndexOutput dataOut = dir.createOutput("bkdd", IOContext.DEFAULT);
+           IndexOutput summaryIndexOut = dir.createOutput("bkdsi", IOContext.DEFAULT);
+           IndexOutput summaryDataOut = dir.createOutput("bkdso", IOContext.DEFAULT)) {
+        w.writeField(metaOut, indexOut, dataOut, summaryIndexOut, summaryDataOut, "tsid1", points, countFunction).run();
+        w.close();
+      }
+
+      try (IndexInput metaIn = dir.openInput("bkdm", IOContext.DEFAULT);
+           IndexInput indexIn = dir.openInput("bkdi", IOContext.DEFAULT);
+           IndexInput dataIn = dir.openInput("bkdd", IOContext.DEFAULT);
+           IndexInput summaryIndexIn = dir.openInput("bkdsi", IOContext.DEFAULT);
+           IndexInput summaryDataIn = dir.openInput("bkdso", IOContext.DEFAULT)) {
+        TSPointQuery tsPointQuery = new TSPointQuery("tsid1", expectedLowerPoint, expectedUpperPoint);
+        BKDWithSummaryReader bkdReader = new BKDWithSummaryReader(metaIn, indexIn, dataIn, summaryIndexIn, summaryDataIn);
+        byte[] res = tsPointQuery.getSummary(bkdReader.getPointTree(), countFunction);
+        // long actualSummary = maxFunction.convertFromBytes(res);
+        // assertEquals(expectedMax, actualSummary);
+        // System.out.println("\n" + actualSummary);
+        int actualCount = countFunction.unpackBytes(res);
+        assertEquals(expectedCount, actualCount);
+        System.out.println("\n" + actualCount);
+      }
+      dir.close();
+    }
+  }
+
+
+  static class MaxFunction implements BKDSummaryWriter.SummaryMergeFunction<Integer> {
+
+    @Override
+    public int getSummarySize() {
+      return Integer.BYTES;
+    }
+
+    @Override
+    public void merge(byte[] a, byte[] b, byte[] res) {
+      if (unpackBytes(a) < unpackBytes(b)) {
+        System.arraycopy(b, 0, res, 0, getSummarySize());
+      } else {
+        System.arraycopy(a, 0, res, 0, getSummarySize());
+      }
+    }
+
+    @Override
+    public Integer unpackBytes(byte[] val) {
+      return NumericUtils.sortableBytesToInt(val, 0);
+    }
+
+    @Override
+    public void packBytes(Integer val, byte[] res) {
+      NumericUtils.intToSortableBytes(val, res, 0);
+    }
+  }
+
+  static class LongMaxFunction implements BKDSummaryWriter.SummaryMergeFunction<Long> {
+
+    @Override
+    public int getSummarySize() {
+      return Long.BYTES;
+    }
+
+    @Override
+    public void merge(byte[] a, byte[] b, byte[] res) {
+      // TODO: implementation
+      if (unpackBytes(a) < unpackBytes(b)) {
+        System.arraycopy(b, 0, res, 0, getSummarySize());
+      } else {
+        System.arraycopy(a, 0, res, 0, getSummarySize());
+      }
+    }
+
+    @Override
+    public Long unpackBytes(byte[] val) {
+      return NumericUtils.sortableBytesToLong(val, 0);
+    }
+
+    @Override
+    public void packBytes(Long val, byte[] res) {
+      NumericUtils.longToSortableBytes(val, res, 0);
+    }
+  }
+
+  static class CountFunction implements BKDSummaryWriter.SummaryMergeFunction<Integer> {
+
+    @Override
+    public int getSummarySize() {
+      return Integer.BYTES;
+    }
+
+    @Override
+    public void merge(byte[] a, byte[] b, byte[] c) {
+      packBytes(unpackBytes(a) + unpackBytes(b), c);
+    }
+
+    @Override
+    public Integer unpackBytes(byte[] val) {
+      return NumericUtils.sortableBytesToInt(val, 0);
+    }
+
+    @Override
+    public void packBytes(Integer val, byte[] res) {
+      NumericUtils.intToSortableBytes(val, res, 0);
+    }
   }
 }

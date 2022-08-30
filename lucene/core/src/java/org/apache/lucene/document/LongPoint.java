@@ -47,7 +47,7 @@ import org.apache.lucene.util.NumericUtils;
  *
  * @see PointValues
  */
-public final class LongPoint extends Field {
+public class LongPoint extends Field {
   private static FieldType getType(int numDims) {
     FieldType type = new FieldType();
     type.setDimensions(numDims, Long.BYTES);
@@ -128,6 +128,9 @@ public final class LongPoint extends Field {
     super(name, pack(point), getType(point.length));
   }
 
+  public LongPoint(String name, FieldType type, long... point) {
+    super(name, pack(point), type);
+  }
   @Override
   public String toString() {
     StringBuilder result = new StringBuilder();

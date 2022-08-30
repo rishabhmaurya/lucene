@@ -51,8 +51,8 @@ public abstract class PointRangeQuery extends Query {
   final String field;
   final int numDims;
   final int bytesPerDim;
-  final byte[] lowerPoint;
-  final byte[] upperPoint;
+  protected final byte[] lowerPoint;
+  protected final byte[] upperPoint;
 
   /**
    * Expert: create a multidimensional range query for point values.

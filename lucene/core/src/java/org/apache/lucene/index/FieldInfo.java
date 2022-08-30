@@ -16,6 +16,9 @@
  */
 package org.apache.lucene.index;
 
+import org.apache.lucene.util.NumericUtils;
+import org.apache.lucene.util.bkd.BKDSummaryWriter;
+
 import java.util.Map;
 import java.util.Objects;
 
@@ -527,6 +530,31 @@ public final class FieldInfo {
     return docValuesType;
   }
 
+  //TODO - move to a better place | maybe FieldInfo?
+  public BKDSummaryWriter.SummaryMergeFunction<?> getMergeFunction() {
+    return new BKDSummaryWriter.SummaryMergeFunction<Integer>() {
+
+      @Override
+      public int getSummarySize() {
+        return Integer.BYTES;
+      }
+
+      @Override
+      public void merge(byte[] a, byte[] b, byte[] c) {
+        packBytes(unpackBytes(a) + unpackBytes(b), c);
+      }
+
+      @Override
+      public Integer unpackBytes(byte[] val) {
+        return NumericUtils.sortableBytesToInt(val, 0);
+      }
+
+      @Override
+      public void packBytes(Integer val, byte[] res) {
+        NumericUtils.intToSortableBytes(val, res, 0);
+      }
+    };
+  }
   /** Sets the docValues generation of this field. */
   void setDocValuesGen(long dvGen) {
     this.dvGen = dvGen;
@@ -582,6 +610,10 @@ public final class FieldInfo {
   /** Returns whether any (numeric) vector values exist for this field */
   public boolean hasVectorValues() {
     return vectorDimension > 0;
+  }
+
+  public boolean hasPointsSummary() {
+    return attributes()!= null && attributes().containsKey("summary");
   }
 
   /** Get a codec attribute value, or null if it does not exist */

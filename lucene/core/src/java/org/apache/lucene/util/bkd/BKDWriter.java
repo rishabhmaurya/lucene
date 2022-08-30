@@ -130,6 +130,9 @@ public class BKDWriter implements Closeable {
   private final long totalPointCount;
 
   private final int maxDoc;
+  int getMaxDoc() {
+    return maxDoc;
+  }
   private final DocIdsWriter docIdsWriter;
 
   public BKDWriter(
@@ -668,7 +671,7 @@ public class BKDWriter implements Closeable {
     return oneDimWriter.finish();
   }
 
-  private class OneDimensionBKDWriter {
+  protected class OneDimensionBKDWriter {
 
     final IndexOutput metaOut, indexOut, dataOut;
     final long dataStartFP;
@@ -676,8 +679,11 @@ public class BKDWriter implements Closeable {
     final List<byte[]> leafBlockStartValues = new ArrayList<>();
     final byte[] leafValues = new byte[config.maxPointsInLeafNode * config.packedBytesLength];
     final int[] leafDocs = new int[config.maxPointsInLeafNode];
-    private long valueCount;
+    protected long valueCount;
     private int leafCount;
+    int getLeafCount() {
+      return leafCount;
+    }
     private int leafCardinality;
 
     OneDimensionBKDWriter(IndexOutput metaOut, IndexOutput indexOut, IndexOutput dataOut) {
@@ -788,6 +794,7 @@ public class BKDWriter implements Closeable {
               return leafBlockFPs.size();
             }
           };
+
       return () -> {
         try {
           writeIndex(metaOut, indexOut, config.maxPointsInLeafNode, leafNodes, dataStartFP);
@@ -855,7 +862,7 @@ public class BKDWriter implements Closeable {
     }
   }
 
-  private int getNumLeftLeafNodes(int numLeaves) {
+  protected int getNumLeftLeafNodes(int numLeaves) {
     assert numLeaves > 1 : "getNumLeftLeaveNodes() called with " + numLeaves;
     // return the level that can be filled with this number of leaves
     int lastFullLevel = 31 - Integer.numberOfLeadingZeros(numLeaves);
@@ -1071,7 +1078,7 @@ public class BKDWriter implements Closeable {
   }
 
   /** Appends the current contents of writeBuffer as another block on the growing in-memory file */
-  private int appendBlock(ByteBuffersDataOutput writeBuffer, List<byte[]> blocks) {
+  protected int appendBlock(ByteBuffersDataOutput writeBuffer, List<byte[]> blocks) {
     byte[] block = writeBuffer.toArrayCopy();
     blocks.add(block);
     writeBuffer.reset();
@@ -1244,7 +1251,7 @@ public class BKDWriter implements Closeable {
     }
   }
 
-  private void writeIndex(
+  protected void writeIndex(
       IndexOutput metaOut,
       IndexOutput indexOut,
       int countPerLeaf,

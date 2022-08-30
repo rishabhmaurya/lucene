@@ -40,7 +40,7 @@ public class Lucene90PointsReader extends PointsReader {
   /** Sole constructor */
   public Lucene90PointsReader(SegmentReadState readState) throws IOException {
     this.readState = readState;
-
+    init(readState);
     String metaFileName =
         IndexFileNames.segmentFileName(
             readState.segmentInfo.name,
@@ -99,11 +99,12 @@ public class Lucene90PointsReader extends PointsReader {
             } else if (fieldNumber < 0) {
               throw new CorruptIndexException("Illegal field number: " + fieldNumber, metaIn);
             }
-            PointValues reader = new BKDReader(metaIn, indexIn, dataIn);
+            PointValues reader = getBKDReader(readState, fieldNumber, metaIn, indexIn, dataIn);
             readers.put(fieldNumber, reader);
           }
           indexLength = metaIn.readLong();
           dataLength = metaIn.readLong();
+          readAdditionalMetadata(metaIn);
         } catch (Throwable t) {
           priorE = t;
         } finally {
@@ -114,12 +115,29 @@ public class Lucene90PointsReader extends PointsReader {
       // know that indexLength and dataLength are very likely correct.
       CodecUtil.retrieveChecksum(indexIn, indexLength);
       CodecUtil.retrieveChecksum(dataIn, dataLength);
+      retrieveAdditionalChecksum();
       success = true;
     } finally {
       if (success == false) {
         IOUtils.closeWhileHandlingException(this);
       }
     }
+  }
+
+  public void init(SegmentReadState readState) throws IOException {
+
+  }
+
+  public BKDReader getBKDReader(SegmentReadState readState, int fieldNo, IndexInput metaIn, IndexInput indexIn, IndexInput dataIn) throws IOException {
+    return new BKDReader(metaIn, indexIn, dataIn);
+  }
+
+  public void readAdditionalMetadata(IndexInput metaIn) throws IOException {
+
+  }
+
+  public void retrieveAdditionalChecksum() throws IOException {
+
   }
 
   /**

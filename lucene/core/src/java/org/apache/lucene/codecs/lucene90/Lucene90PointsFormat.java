@@ -58,8 +58,8 @@ public final class Lucene90PointsFormat extends PointsFormat {
   /** Filename extension for the meta per field */
   public static final String META_EXTENSION = "kdm";
 
-  static final int VERSION_START = 0;
-  static final int VERSION_CURRENT = VERSION_START;
+  public static final int VERSION_START = 0;
+  public static final int VERSION_CURRENT = VERSION_START;
 
   /** Sole constructor */
   public Lucene90PointsFormat() {}

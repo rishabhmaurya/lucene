@@ -43,8 +43,8 @@ public class Lucene90PointsWriter extends PointsWriter {
   protected final IndexOutput metaOut, indexOut, dataOut;
 
   final SegmentWriteState writeState;
-  final int maxPointsInLeafNode;
-  final double maxMBSortInHeap;
+  public final int maxPointsInLeafNode;
+  public final double maxMBSortInHeap;
   private boolean finished;
 
   /** Full constructor */
@@ -128,18 +128,12 @@ public class Lucene90PointsWriter extends PointsWriter {
             maxPointsInLeafNode);
 
     try (BKDWriter writer =
-        new BKDWriter(
-            writeState.segmentInfo.maxDoc(),
-            writeState.directory,
-            writeState.segmentInfo.name,
-            config,
-            maxMBSortInHeap,
-            values.size())) {
+        getBKDWriter(writeState, values, config, fieldInfo)) {
 
       if (values instanceof MutablePointTree) {
         Runnable finalizer =
-            writer.writeField(
-                metaOut, indexOut, dataOut, fieldInfo.name, (MutablePointTree) values);
+            writeField(
+                metaOut, indexOut, dataOut, fieldInfo, (MutablePointTree) values, writer);
         if (finalizer != null) {
           metaOut.writeInt(fieldInfo.number);
           finalizer.run();
@@ -166,7 +160,7 @@ public class Lucene90PointsWriter extends PointsWriter {
           });
 
       // We could have 0 points on merge since all docs with dimensional fields may be deleted:
-      Runnable finalizer = writer.finish(metaOut, indexOut, dataOut);
+      Runnable finalizer = writerFinish(writer, metaOut, indexOut, dataOut);
       if (finalizer != null) {
         metaOut.writeInt(fieldInfo.number);
         finalizer.run();
@@ -174,6 +168,29 @@ public class Lucene90PointsWriter extends PointsWriter {
     }
   }
 
+  public Runnable writeField(IndexOutput metaOut,
+                             IndexOutput indexOut,
+                             IndexOutput dataOut,
+                             FieldInfo fieldInfo,
+                             PointValues.PointTree pointTree,
+                             BKDWriter writer) throws IOException {
+    return writer.writeField(
+            metaOut, indexOut, dataOut, fieldInfo.getName(), (MutablePointTree) pointTree);
+  }
+
+  public Runnable writerFinish(BKDWriter writer, IndexOutput metaOut, IndexOutput indexOut, IndexOutput dataOut) throws IOException {
+    return writer.finish(metaOut, indexOut, dataOut);
+  }
+  public BKDWriter getBKDWriter(SegmentWriteState writeState, PointValues.PointTree values, BKDConfig config, FieldInfo fieldInfo) {
+    return new BKDWriter(
+                    writeState.segmentInfo.maxDoc(),
+                    writeState.directory,
+                    writeState.segmentInfo.name,
+                    config,
+                    maxMBSortInHeap,
+                    values.size());
+
+  }
   @Override
   public void merge(MergeState mergeState) throws IOException {
     /**
@@ -287,7 +304,11 @@ public class Lucene90PointsWriter extends PointsWriter {
     CodecUtil.writeFooter(dataOut);
     metaOut.writeLong(indexOut.getFilePointer());
     metaOut.writeLong(dataOut.getFilePointer());
+    writeAdditionalMetadata(metaOut);
     CodecUtil.writeFooter(metaOut);
+  }
+  public void writeAdditionalMetadata(IndexOutput metaOut) throws IOException {
+
   }
 
   @Override

@@ -317,6 +317,24 @@ public abstract class PointValues {
       }
     }
 
+    default void visit(int docID, byte[] packedValue, byte[] packedSummary) throws IOException {
+      throw new UnsupportedOperationException();
+    }
+    /**
+     * Called for any node fully contained by the query. The caller can blindly accept it. Only called
+     * if packedSummary is supported by the tree. If visit doesn't throw UnsupportedOperationException, it is
+     * assumed that docIDs, in leaf cells under current node, doesn't need to be iterated and
+     * just summary data is of interest. Also, not all tree will support this operation,
+     * so this will never be called for trees which doesn't support/contain summary data.
+     * If the search goes down all the way to leaf cell Point, then visit(docID) will be called too!
+     * @param packedSummary aggregated summary of all the leaf cells of subtree under this node
+     * @param firstDocID the first docID present in the leaf cells under this subtree
+     * @param lastDocID the last docID present in the leaf cells under this subtree
+     * @throws IOException
+     */
+    default void visit(byte[] packedSummary, int firstDocID, int lastDocID) throws IOException {
+      throw new UnsupportedOperationException();
+    }
     /**
      * Called for non-leaf cells to test how the cell relates to the query, to determine how to
      * further recurse down the tree.

@@ -39,6 +39,7 @@ import org.apache.lucene.codecs.PointsFormat;
 import org.apache.lucene.codecs.PointsWriter;
 import org.apache.lucene.document.FieldType;
 import org.apache.lucene.document.KnnVectorField;
+import org.apache.lucene.document.TSIntPoint;
 import org.apache.lucene.search.DocIdSetIterator;
 import org.apache.lucene.search.Sort;
 import org.apache.lucene.search.SortField;
@@ -262,6 +263,12 @@ final class IndexingChain implements Accountable {
     }
 
     t0 = System.nanoTime();
+    writeTSPoints(state, sortMap);
+    if (infoStream.isEnabled("IW")) {
+      infoStream.message("IW", ((System.nanoTime() - t0) / 1000000) + " msec to write points");
+    }
+
+    t0 = System.nanoTime();
     writeVectors(state, sortMap);
     if (infoStream.isEnabled("IW")) {
       infoStream.message("IW", ((System.nanoTime() - t0) / 1000000) + " msec to write vectors");
@@ -346,6 +353,48 @@ final class IndexingChain implements Accountable {
               perField.pointValuesWriter.flush(state, sortMap, pointsWriter);
             }
             perField.pointValuesWriter = null;
+          }
+          perField = perField.next;
+        }
+      }
+      if (pointsWriter != null) {
+        pointsWriter.finish();
+      }
+      success = true;
+    } finally {
+      if (success) {
+        IOUtils.close(pointsWriter);
+      } else {
+        IOUtils.closeWhileHandlingException(pointsWriter);
+      }
+    }
+  }
+
+  /** Writes all buffered points. */
+  private void writeTSPoints(SegmentWriteState state, Sorter.DocMap sortMap) throws IOException {
+    PointsWriter pointsWriter = null;
+    boolean success = false;
+    try {
+      for (int i = 0; i < fieldHash.length; i++) {
+        PerField perField = fieldHash[i];
+        while (perField != null) {
+          if (perField.tsPointValuesWriter != null) {
+            // We could have initialized tsPointValuesWriter, but failed to write even a single doc
+            if (perField.tsPointValuesWriter.getNumDocs() > 0) {
+              if (pointsWriter == null) {
+                // lazy init
+                PointsFormat fmt = state.segmentInfo.getCodec().pointsFormat();
+                if (fmt == null) {
+                  throw new IllegalStateException(
+                          "field=\""
+                                  + perField.fieldInfo.name
+                                  + "\" was indexed as points but codec does not support points");
+                }
+                pointsWriter = fmt.fieldsWriter(state);
+              }
+              perField.tsPointValuesWriter.flush(state, sortMap, pointsWriter);
+            }
+            perField.tsPointValuesWriter = null;
           }
           perField = perField.next;
         }
@@ -713,6 +762,11 @@ final class IndexingChain implements Accountable {
     if (fi.getPointDimensionCount() != 0) {
       pf.pointValuesWriter = new PointValuesWriter(bytesUsed, fi);
     }
+
+    if (fi.hasPointsSummary()) {
+      pf.tsPointValuesWriter = new TSPointValuesWriter(bytesUsed, fi);
+    }
+
     if (fi.getVectorDimension() != 0) {
       pf.vectorValuesWriter = new VectorValuesWriter(fi, bytesUsed);
     }
@@ -758,8 +812,13 @@ final class IndexingChain implements Accountable {
       indexDocValue(docID, pf, dvType, field);
     }
     if (fieldType.pointDimensionCount() != 0) {
-      pf.pointValuesWriter.addPackedValue(docID, field.binaryValue());
+      if (pf.fieldInfo.hasPointsSummary()) {
+        pf.tsPointValuesWriter.addPackedValue(docID, field.binaryValue(), ((TSIntPoint) field).getPackedMetrics());
+      } else {
+        pf.pointValuesWriter.addPackedValue(docID, field.binaryValue());
+      }
     }
+
     if (fieldType.vectorDimension() != 0) {
       pf.vectorValuesWriter.addValue(docID, ((KnnVectorField) field).vectorValue());
     }
@@ -1031,7 +1090,7 @@ final class IndexingChain implements Accountable {
 
     // Non-null if this field ever had points in this segment:
     PointValuesWriter pointValuesWriter;
-
+    TSPointValuesWriter tsPointValuesWriter;
     // Non-null if this field ever had vector values in this segment:
     VectorValuesWriter vectorValuesWriter;
 

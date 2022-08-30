@@ -45,7 +45,7 @@ public class BKDReader extends PointValues {
 
   final IndexInput packedIndex;
   // if true, the tree is a legacy balanced tree
-  private final boolean isTreeBalanced;
+  final boolean isTreeBalanced;
 
   /**
    * Caller must pre-seek the provided {@link IndexInput} to the index location that {@link
@@ -169,8 +169,8 @@ public class BKDReader extends PointValues {
         isTreeBalanced);
   }
 
-  private static class BKDPointTree implements PointTree {
-    private int nodeID;
+  static class BKDPointTree implements PointTree {
+    int nodeID;
     // during clone, the node root can be different to 1
     private final int nodeRoot;
     // level is 1-based so that we can do level-1 w/o checking each time:
@@ -200,17 +200,17 @@ public class BKDReader extends PointValues {
     // holds the previous value of the split dimension
     private final byte[][] splitDimValueStack;
     // tree parameters
-    private final BKDConfig config;
+    final BKDConfig config;
     // number of leaves
-    private final int leafNodeOffset;
+    final int leafNodeOffset;
     // version of the index
     private final int version;
     // total number of points
     final long pointCount;
     // last node might not be fully populated
-    private final int lastLeafNodePointCount;
+    final int lastLeafNodePointCount;
     // right most leaf node ID
-    private final int rightMostLeafNode;
+    final int rightMostLeafNode;
     // helper objects for reading doc values
     private final byte[] scratchDataPackedValue,
         scratchMinIndexPackedValue,
@@ -219,9 +219,9 @@ public class BKDReader extends PointValues {
     private final BKDReaderDocIDSetIterator scratchIterator;
     private final DocIdsWriter docIdsWriter;
     // if true the tree is balanced, otherwise unbalanced
-    private final boolean isTreeBalanced;
+    final boolean isTreeBalanced;
 
-    private BKDPointTree(
+    BKDPointTree(
         IndexInput innerNodes,
         IndexInput leafNodes,
         BKDConfig config,
@@ -365,7 +365,7 @@ public class BKDReader extends PointValues {
       return true;
     }
 
-    private void resetNodeDataPosition() throws IOException {
+    void resetNodeDataPosition() throws IOException {
       // move position of the inner nodes index to visit the first child
       assert readNodeDataPositions[level] <= innerNodes.getFilePointer();
       innerNodes.seek(readNodeDataPositions[level]);
@@ -395,7 +395,7 @@ public class BKDReader extends PointValues {
           splitValuesStack[level], splitDimPos, maxPackedValue, splitDimPos, config.bytesPerDim);
     }
 
-    private void pushLeft() throws IOException {
+    void pushLeft() throws IOException {
       nodeID *= 2;
       level++;
       readNodeData(true);
@@ -477,7 +477,7 @@ public class BKDReader extends PointValues {
       return (nodeID & 1) == 0;
     }
 
-    private boolean isLeafNode() {
+     boolean isLeafNode() {
       return nodeID >= leafNodeOffset;
     }
 
@@ -653,7 +653,7 @@ public class BKDReader extends PointValues {
       }
     }
 
-    private void readNodeData(boolean isLeft) throws IOException {
+    void readNodeData(boolean isLeft) throws IOException {
       leafBlockFPStack[level] = leafBlockFPStack[level - 1];
       if (isLeft == false) {
         // read leaf block FP delta
