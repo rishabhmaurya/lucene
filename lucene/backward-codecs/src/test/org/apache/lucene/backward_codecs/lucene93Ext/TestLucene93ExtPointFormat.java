@@ -63,7 +63,7 @@ public class TestLucene93ExtPointFormat extends BasePointsFormatTestCase {
         iwc.setMergePolicy(mergePolicy);
         IndexWriter w = new IndexWriter(dir, iwc);
 
-        final int numDocs = 10000000;
+        final int numDocs = 100000;
         int low = random().nextInt(numDocs/100);
         int high = random().nextInt(low, numDocs - 1);
         int exp = 0;
@@ -115,8 +115,8 @@ public class TestLucene93ExtPointFormat extends BasePointsFormatTestCase {
             }
             assertEquals(exp, actualCount);
 
-            System.out.println("Matching docs count:" + actualCount + " | Segments:" + segments + " | DiskAccess: "
-                    + diskAccess);
+            // System.out.println("Matching docs count:" + actualCount + " | Segments:" + segments + " | DiskAccess: "
+            //        + diskAccess);
         }
         r.close();
         finish = Instant.now();
@@ -139,7 +139,7 @@ public class TestLucene93ExtPointFormat extends BasePointsFormatTestCase {
         MergePolicy mergePolicy = NoMergePolicy.INSTANCE;
         iwc.setMergePolicy(mergePolicy);
         IndexWriter w = new IndexWriter(dir, iwc);
-        final int numDocs = 10000000;
+        final int numDocs = 100000;
         int low = random().nextInt(numDocs/100);
         int high = random().nextInt(low, numDocs - 1);
         int exp = 0;
@@ -205,8 +205,8 @@ public class TestLucene93ExtPointFormat extends BasePointsFormatTestCase {
             });
             assertEquals(exp, actualRes[0]);
 
-            System.out.println("Matching docs count:" + match[0] + " | Segments:" + segments[0] + " | DiskAccess: "
-                    + match[0]);
+            // System.out.println("Matching docs count:" + match[0] + " | Segments:" + segments[0] + " | DiskAccess: "
+            //         + match[0]);
 
         }
         reader.close();

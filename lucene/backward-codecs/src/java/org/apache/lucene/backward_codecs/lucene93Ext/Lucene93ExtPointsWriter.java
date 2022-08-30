@@ -95,7 +95,11 @@ public class Lucene93ExtPointsWriter extends Lucene90PointsWriter {
     @Override
     public Runnable writerFinish(BKDWriter writer, IndexOutput metaOut, IndexOutput indexOut, IndexOutput dataOut)
             throws IOException {
-        throw new UnsupportedOperationException("Merge on BKDTrees is not yet supported yet");
+        if (writer instanceof BKDSummaryWriter) {
+            throw new UnsupportedOperationException("Merge on BKDTrees is not yet supported yet");
+        } else {
+            return super.writerFinish(writer, metaOut, indexOut, dataOut);
+        }
     }
 
     @Override
