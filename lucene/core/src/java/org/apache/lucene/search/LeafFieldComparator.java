@@ -96,6 +96,10 @@ public interface LeafFieldComparator {
    */
   void setScorer(Scorable scorer) throws IOException;
 
+  default void setScorer(Scorable scorer, int numHits) throws IOException {
+    this.setScorer(scorer);
+  }
+
   /**
    * Returns a competitive iterator
    *
