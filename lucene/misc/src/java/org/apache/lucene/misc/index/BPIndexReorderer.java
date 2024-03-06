@@ -254,15 +254,19 @@ public final class BPIndexReorderer {
     private final float[] biases;
     private final CloseableThreadLocal<PerThreadState> threadLocal;
 
+    private final Stats stats;
+
     IndexReorderingTask(
         IntsRef docIDs,
         float[] biases,
         CloseableThreadLocal<PerThreadState> threadLocal,
-        int depth) {
+        int depth,
+        Stats stats) {
       super(depth);
       this.docIDs = docIDs;
       this.biases = biases;
       this.threadLocal = threadLocal;
+      this.stats = stats;
     }
 
     private void computeDocFreqs(IntsRef docs, ForwardIndex forwardIndex, int[] docFreqs) {
@@ -326,9 +330,9 @@ public final class BPIndexReorderer {
 
       // It is fine for all tasks to share the same docs / biases array since they all work on
       // different slices of the array at a given point in time.
-      IndexReorderingTask leftTask = new IndexReorderingTask(left, biases, threadLocal, depth + 1);
+      IndexReorderingTask leftTask = new IndexReorderingTask(left, biases, threadLocal, depth + 1, stats);
       IndexReorderingTask rightTask =
-          new IndexReorderingTask(right, biases, threadLocal, depth + 1);
+          new IndexReorderingTask(right, biases, threadLocal, depth + 1, stats);
 
       if (shouldFork(docIDs.length, docIDs.ints.length)) {
         invokeAll(leftTask, rightTask);
@@ -396,8 +400,12 @@ public final class BPIndexReorderer {
 
         @Override
         protected int comparePivot(int j) {
-          int cmp = Float.compare(pivotBias, biases[j]);
-          if (cmp == 0) {
+          int cmp = Float.compare(pivotBias-iter, biases[j]);
+          if (cmp > 0) {
+            return cmp;
+          }
+          cmp = Float.compare(pivotBias, biases[j]);
+          if (cmp >= 0) {
             // Tie break on the doc ID to preserve doc ID ordering as much as possible
             cmp = pivotDoc - docIDs.ints[j];
           }
@@ -409,7 +417,7 @@ public final class BPIndexReorderer {
           float tmpBias = biases[i];
           biases[i] = biases[j];
           biases[j] = tmpBias;
-
+          stats.addSwapsPerRecursion(depth);
           if (i < midPoint == j < midPoint) {
             int tmpDoc = docIDs.ints[i];
             docIDs.ints[i] = docIDs.ints[j];
@@ -431,7 +439,7 @@ public final class BPIndexReorderer {
       return true;
     }
 
-    private static void swapDocsAndFreqs(
+    private void swapDocsAndFreqs(
         int[] docs,
         int left,
         int right,
@@ -528,7 +536,7 @@ public final class BPIndexReorderer {
      * Compute a float that is negative when a document is attracted to the left and positive
      * otherwise.
      */
-    private static float computeBias(
+    private float computeBias(
         int docID, ForwardIndex forwardIndex, int[] fromDocFreqs, int[] toDocFreqs)
         throws IOException {
       forwardIndex.seek(docID);
@@ -606,7 +614,7 @@ public final class BPIndexReorderer {
   }
 
   private int writePostings(
-      CodecReader reader, Set<String> fields, Directory tempDir, DataOutput postingsOut)
+      CodecReader reader, Set<String> fields, Directory tempDir, DataOutput postingsOut, Stats stats)
       throws IOException {
     final int maxNumTerms =
         (int)
@@ -614,7 +622,7 @@ public final class BPIndexReorderer {
                 / getParallelism()
                 / termRAMRequirementsPerThreadPerTerm());
     final int maxDocFreq = (int) ((double) this.maxDocFreq * reader.maxDoc());
-
+    long totalPostings = 0;
     int numTerms = 0;
     for (String field : fields) {
       Terms terms = reader.terms(field);
@@ -652,9 +660,12 @@ public final class BPIndexReorderer {
             doc != DocIdSetIterator.NO_MORE_DOCS;
             doc = postings.nextDoc()) {
           postingsOut.writeLong(Integer.toUnsignedLong(termID) << 32 | Integer.toUnsignedLong(doc));
+          totalPostings++;
         }
       }
     }
+    stats.setNumTerms(numTerms);
+    stats.setTotalPostings(totalPostings);
     return numTerms;
   }
 
@@ -794,9 +805,10 @@ public final class BPIndexReorderer {
     ForwardIndex forwardIndex = null;
     IndexOutput postingsOutput = null;
     boolean success = false;
+    Stats stats = new Stats(maxDoc);
     try {
       postingsOutput = trackingDir.createTempOutput("postings", "", IOContext.DEFAULT);
-      int numTerms = writePostings(reader, fields, trackingDir, postingsOutput);
+      int numTerms = writePostings(reader, fields, trackingDir, postingsOutput, stats);
       CodecUtil.writeFooter(postingsOutput);
       postingsOutput.close();
       final ForwardIndex finalForwardIndex =
@@ -817,7 +829,7 @@ public final class BPIndexReorderer {
             }
           }) {
         IntsRef docs = new IntsRef(sortedDocs, 0, sortedDocs.length);
-        IndexReorderingTask task = new IndexReorderingTask(docs, new float[maxDoc], threadLocal, 0);
+        IndexReorderingTask task = new IndexReorderingTask(docs, new float[maxDoc], threadLocal, 0, stats);
         if (forkJoinPool != null) {
           forkJoinPool.execute(task);
           task.join();
@@ -827,6 +839,7 @@ public final class BPIndexReorderer {
       }
 
       success = true;
+      System.out.println(stats);
       return sortedDocs;
     } finally {
       if (success) {
@@ -1110,5 +1123,41 @@ public final class BPIndexReorderer {
     void accept(long value) throws IOException;
 
     default void onFinish() throws IOException {}
+  }
+
+  static class Stats {
+    int numTerms;
+    long totalPostings;
+    int totalDocs;
+    int totalSwapsPerformed;
+    int [] swapsPerRecursion; // pre-order
+
+    Stats(int totalDocs) {
+      this.totalDocs = totalDocs;
+      swapsPerRecursion = new int[(int) Math.ceil(fastLog2(totalDocs)+1)];
+    }
+
+    void setNumTerms(int numTerms) {
+      this.numTerms = numTerms;
+    }
+
+    void setTotalPostings(long totalPostings) {
+      this.totalPostings = totalPostings;
+    }
+
+    void addSwapsPerRecursion(int depth) {
+      swapsPerRecursion[depth] += 1;
+      totalSwapsPerformed += 1;
+    }
+
+    @Override
+    public String toString() {
+      StringBuilder out = new StringBuilder("Reorder stats\ntotalDocs: " + totalDocs + "; numTerms: " + numTerms + "; totalPostings: " + totalPostings +
+              "; totalSwapsPerformed: " + totalSwapsPerformed + "; postingsDocRatio: " + totalPostings/totalDocs + "; swapsDocsRatio: " + totalSwapsPerformed/totalDocs + "\n");
+        for (int j : swapsPerRecursion) {
+            out.append(j).append(" ");
+        }
+      return out.toString();
+    }
   }
 }
