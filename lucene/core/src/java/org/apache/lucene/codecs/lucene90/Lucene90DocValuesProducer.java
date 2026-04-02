@@ -1945,20 +1945,24 @@ final class Lucene90DocValuesProducer extends DocValuesProducer {
           compressed.bytes, compressed.offset, compressed.length, output);
     }
 
-    /** Buffered read-ahead for sequential access — avoids per-term mmap reads. */
+    /** Buffered read-ahead for sequential access. */
     private static final int SEQ_BUF_SIZE = 4096;
     private final byte[] seqBuf = new byte[SEQ_BUF_SIZE];
     private int seqBufPos = 0;
     private int seqBufLen = 0;
 
+    /** Block-decompressed output buffer and term boundaries. */
+    private final byte[] decompBuf = new byte[SEQ_BUF_SIZE * 8 + 8];
+    private final int[] blockTermStarts = new int[SEQ_BUF_SIZE];
+    private int blockTermCount = 0;
+    private int blockTermIdx = 0;
+
     private void fillSeqBuf() throws IOException {
-      // Shift remaining bytes to front
       int remaining = seqBufLen - seqBufPos;
       if (remaining > 0) {
         System.arraycopy(seqBuf, seqBufPos, seqBuf, 0, remaining);
       }
       seqBufPos = 0;
-      // Fill rest from mmap
       int toRead = Math.min(SEQ_BUF_SIZE - remaining, (int) (seqBytes.length() - seqBytes.getFilePointer()));
       if (toRead > 0) {
         seqBytes.readBytes(seqBuf, remaining, toRead);
@@ -1966,52 +1970,66 @@ final class Lucene90DocValuesProducer extends DocValuesProducer {
       seqBufLen = remaining + toRead;
     }
 
-    private int readVIntFromBuf() throws IOException {
+    /** Decompress all terms in seqBuf into decompBuf in one pass. */
+    private void decompressBlock() throws IOException {
       if (seqBufPos >= seqBufLen) fillSeqBuf();
-      byte b = seqBuf[seqBufPos++];
-      if (b >= 0) return b;
-      int i = b & 0x7F;
-      if (seqBufPos >= seqBufLen) fillSeqBuf();
-      b = seqBuf[seqBufPos++];
-      i |= (b & 0x7F) << 7;
-      if (b >= 0) return i;
-      if (seqBufPos >= seqBufLen) fillSeqBuf();
-      b = seqBuf[seqBufPos++];
-      i |= (b & 0x7F) << 14;
-      if (b >= 0) return i;
-      if (seqBufPos >= seqBufLen) fillSeqBuf();
-      b = seqBuf[seqBufPos++];
-      i |= (b & 0x7F) << 21;
-      if (b >= 0) return i;
-      if (seqBufPos >= seqBufLen) fillSeqBuf();
-      b = seqBuf[seqBufPos++];
-      return i | ((b & 0x7F) << 28);
-    }
 
-    /** Sequential decompression — inlined from seqBuf, no method call overhead per term. */
-    private void decompressTermSequential() throws IOException {
-      int compLen = readVIntFromBuf();
-      if (seqBufPos + compLen > seqBufLen) fillSeqBuf();
-
-      // Inline decompression from seqBuf directly — avoids per-term method call overhead
-      final byte[] symbolLen = decompressor.symbolTable().len;
-      final long[] symbol = decompressor.symbolTable().decodeLong;
-      final byte[] out = term.bytes;
+      final byte[] symLen = decompressor.symbolTable().len;
+      final long[] symVal = decompressor.symbolTable().decodeLong;
       final byte[] in = seqBuf;
-      int pos = seqBufPos;
-      int end = pos + compLen;
+      final byte[] out = decompBuf;
+      int inPos = seqBufPos;
       int outPos = 0;
-      while (pos < end) {
-        int code = in[pos++] & 0xFF;
-        if (code != 0xFF) {
-          BitUtil.VH_LE_LONG.set(out, outPos, symbol[code]);
-          outPos += symbolLen[code] & 0xFF;
+      int termIdx = 0;
+
+      while (inPos < seqBufLen) {
+        // Read varint length (inline, 1-2 byte fast path)
+        int compLen;
+        byte b = in[inPos++];
+        if (b >= 0) {
+          compLen = b;
         } else {
-          out[outPos++] = in[pos++];
+          if (inPos >= seqBufLen) { inPos--; break; }
+          compLen = (b & 0x7F) | ((in[inPos++] & 0x7F) << 7);
+        }
+
+        // Check compressed data fits
+        if (inPos + compLen > seqBufLen) {
+          inPos -= (compLen < 128) ? 1 : 2;
+          break;
+        }
+
+        blockTermStarts[termIdx++] = outPos;
+
+        // Decompress this term's codes
+        int end = inPos + compLen;
+        while (inPos < end) {
+          int code = in[inPos++] & 0xFF;
+          if (code != 0xFF) {
+            BitUtil.VH_LE_LONG.set(out, outPos, symVal[code]);
+            outPos += symLen[code] & 0xFF;
+          } else {
+            out[outPos++] = in[inPos++];
+          }
         }
       }
-      term.length = outPos;
-      seqBufPos = end;
+      blockTermStarts[termIdx] = outPos;
+      blockTermCount = termIdx;
+      blockTermIdx = 0;
+      seqBufPos = inPos;
+    }
+
+    /** Sequential access — serve from pre-decompressed block. */
+    private void decompressTermSequential() throws IOException {
+      if (blockTermIdx >= blockTermCount) {
+        decompressBlock();
+      }
+      int start = blockTermStarts[blockTermIdx];
+      int len = blockTermStarts[blockTermIdx + 1] - start;
+      System.arraycopy(decompBuf, start, term.bytes, 0, len);
+      term.offset = 0;
+      term.length = len;
+      blockTermIdx++;
     }
 
     /** Random access decompression — uses offset lookup. Also positions seqBytes for subsequent sequential reads. */
@@ -2021,21 +2039,25 @@ final class Lucene90DocValuesProducer extends DocValuesProducer {
       int compLen = bytes.readVInt();
       bytes.readBytes(compressedBuf, 0, compLen);
       term.length = decompressor.decompress(compressedBuf, 0, compLen, term.bytes);
-      // Position seqBytes right after this term and invalidate buffer
+      // Position seqBytes right after this term and invalidate buffers
       seqBytes.seek(bytes.getFilePointer());
       seqBufPos = 0;
       seqBufLen = 0;
+      blockTermCount = 0;
+      blockTermIdx = 0;
     }
 
     @Override
     public BytesRef next() throws IOException {
       ++ord;
       if (ord >= termsDictSize) return null;
-      if (ord == seqOrd + 1) {
-        // Sequential: just read next length-prefixed term, no offset lookup
+      if (blockTermIdx < blockTermCount) {
+        // Serve from pre-decompressed block
+        decompressTermSequential();
+      } else if (ord == seqOrd + 1) {
+        // Block exhausted but we're sequential — decompress next block
         decompressTermSequential();
       } else {
-        // Random jump: seek via offsets, then read
         decompressTermRandom(ord);
       }
       seqOrd = ord;
@@ -2045,10 +2067,13 @@ final class Lucene90DocValuesProducer extends DocValuesProducer {
     @Override
     public void seekExact(long ord) throws IOException {
       this.ord = ord;
-      if (ord == seqOrd + 1) {
+      if (blockTermIdx < blockTermCount && ord == seqOrd + 1) {
         decompressTermSequential();
       } else {
         decompressTermRandom(ord);
+        // Invalidate block so next sequential starts fresh
+        blockTermCount = 0;
+        blockTermIdx = 0;
       }
       seqOrd = ord;
     }
