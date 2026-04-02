@@ -16,7 +16,13 @@
  */
 package org.apache.lucene.benchmark.jmh;
 
+import java.io.BufferedReader;
+import java.io.FileReader;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Random;
 import java.util.concurrent.TimeUnit;
 import org.apache.lucene.codecs.DocValuesFormat;
@@ -48,8 +54,15 @@ import org.openjdk.jmh.annotations.Warmup;
 import org.openjdk.jmh.infra.Blackhole;
 
 /**
- * Microbenchmark comparing LZ4 vs FSST term dictionary lookupOrd performance. Tests sequential and
- * random access patterns on sorted doc values with URL-like string terms.
+ * Microbenchmark comparing LZ4 vs FSST doc values term dictionary performance. Supports real
+ * Wikipedia data via -p dataFile=/path/to/enwiki-lines.txt or falls back to synthetic data.
+ *
+ * <p>Run with real data:
+ *
+ * <pre>
+ * java --add-modules jdk.incubator.vector -jar lucene-benchmark-jmh.jar \
+ *   FSSTDocValuesBenchmark -p dataFile=/path/to/enwiki.txt -p numTerms=50000
+ * </pre>
  */
 @BenchmarkMode(Mode.Throughput)
 @OutputTimeUnit(TimeUnit.MILLISECONDS)
@@ -70,8 +83,12 @@ public class FSSTDocValuesBenchmark {
   @Param({"LZ4", "FSST"})
   String mode;
 
-  @Param({"10000"})
+  @Param({"50000"})
   int numTerms;
+
+  /** Path to enwiki line docs file. Empty string uses synthetic data. */
+  @Param({""})
+  String dataFile;
 
   private Path tempDir;
   private MMapDirectory directory;
@@ -82,7 +99,12 @@ public class FSSTDocValuesBenchmark {
 
   @Setup(Level.Trial)
   public void setup() throws Exception {
-    tempDir = java.nio.file.Files.createTempDirectory("fsst-bench");
+    List<String> terms =
+        (dataFile != null && !dataFile.isEmpty())
+            ? loadWikiTitles(dataFile, numTerms)
+            : generateSyntheticTerms(numTerms);
+
+    tempDir = Files.createTempDirectory("fsst-bench");
     directory = new MMapDirectory(tempDir);
 
     TermsDictMode termsDictMode =
@@ -96,40 +118,59 @@ public class FSSTDocValuesBenchmark {
           }
         };
 
-    // Create index with URL-like terms
+    // Index and measure indexing time
+    long rawBytes = 0;
+    long indexStart = System.nanoTime();
     IndexWriterConfig conf = new IndexWriterConfig().setCodec(codec);
     try (IndexWriter writer = new IndexWriter(directory, conf)) {
-      for (int i = 0; i < numTerms; i++) {
+      for (String term : terms) {
         Document doc = new Document();
-        String url =
-            "http://example" + (i % 100) + ".com/page/" + i + "/detail?id=" + (i * 7 % 9999);
-        doc.add(new SortedDocValuesField("url", new BytesRef(url)));
+        byte[] bytes = term.getBytes(StandardCharsets.UTF_8);
+        rawBytes += bytes.length;
+        doc.add(new SortedDocValuesField("field", new BytesRef(bytes)));
         writer.addDocument(doc);
       }
       writer.forceMerge(1);
     }
+    long indexMs = (System.nanoTime() - indexStart) / 1_000_000;
+
+    // Measure file sizes
+    long dvdSize = 0, dvmSize = 0;
+    for (var f : Files.list(tempDir).toList()) {
+      String name = f.getFileName().toString();
+      if (name.endsWith(".dvd")) dvdSize += Files.size(f);
+      if (name.endsWith(".dvm")) dvmSize += Files.size(f);
+    }
 
     reader = DirectoryReader.open(directory);
-    docValues = reader.leaves().get(0).reader().getSortedDocValues("url");
+    docValues = reader.leaves().get(0).reader().getSortedDocValues("field");
     valueCount = docValues.getValueCount();
 
-    // Pre-generate random ordinals for random access benchmark
     Random rng = new Random(42);
-    randomOrds = new int[10000];
+    randomOrds = new int[Math.min(10000, valueCount)];
     for (int i = 0; i < randomOrds.length; i++) {
       randomOrds[i] = rng.nextInt(valueCount);
     }
+
+    // Report stats
+    long totalSize = dvdSize + dvmSize;
+    System.out.printf(
+        "%n[%s] docs=%d uniqueTerms=%d rawBytes=%,d dvd+dvm=%,d ratio=%.1f%% indexTime=%dms%n",
+        mode,
+        terms.size(),
+        valueCount,
+        rawBytes,
+        totalSize,
+        totalSize * 100.0 / rawBytes,
+        indexMs);
   }
 
   @TearDown(Level.Trial)
   public void tearDown() throws Exception {
     reader.close();
     directory.close();
-    // Clean up temp files
-    for (var f : java.nio.file.Files.list(tempDir).toList()) {
-      java.nio.file.Files.deleteIfExists(f);
-    }
-    java.nio.file.Files.deleteIfExists(tempDir);
+    for (var f : Files.list(tempDir).toList()) Files.deleteIfExists(f);
+    Files.deleteIfExists(tempDir);
   }
 
   /** Sequential lookupOrd: iterate all ordinals in order. */
@@ -148,7 +189,7 @@ public class FSSTDocValuesBenchmark {
     }
   }
 
-  /** lookupCompressedOrd (FSST only — returns compressed bytes without decompression). */
+  /** Compressed ordinal access — FSST returns compressed bytes; LZ4 falls back to lookupOrd. */
   @Benchmark
   public void lookupCompressedOrd(Blackhole bh) throws Exception {
     if (docValues instanceof FSSTCompressedAccess fsst && fsst.hasCompressedAccess()) {
@@ -156,10 +197,35 @@ public class FSSTDocValuesBenchmark {
         bh.consume(fsst.lookupCompressedOrd(ord));
       }
     } else {
-      // Fallback for LZ4 — just do regular lookupOrd
       for (int ord : randomOrds) {
         bh.consume(docValues.lookupOrd(ord));
       }
     }
+  }
+
+  /** Load Wikipedia article titles from enwiki line docs file. */
+  private static List<String> loadWikiTitles(String path, int maxTerms) throws Exception {
+    List<String> titles = new ArrayList<>();
+    try (var br = new BufferedReader(new FileReader(path, StandardCharsets.UTF_8))) {
+      String line;
+      while ((line = br.readLine()) != null && titles.size() < maxTerms) {
+        if (line.startsWith("FIELDS_HEADER")) continue;
+        int tab = line.indexOf('\t');
+        if (tab > 0) {
+          titles.add(line.substring(0, tab));
+        }
+      }
+    }
+    return titles;
+  }
+
+  /** Generate synthetic URL-like terms as fallback. */
+  private static List<String> generateSyntheticTerms(int count) {
+    List<String> terms = new ArrayList<>();
+    for (int i = 0; i < count; i++) {
+      terms.add(
+          "http://example" + (i % 100) + ".com/page/" + i + "/detail?id=" + (i * 7 % 9999));
+    }
+    return terms;
   }
 }
