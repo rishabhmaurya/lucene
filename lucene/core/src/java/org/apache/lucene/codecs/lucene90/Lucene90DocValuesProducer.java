@@ -1939,13 +1939,22 @@ final class Lucene90DocValuesProducer extends DocValuesProducer {
           compressed.bytes, compressed.offset, compressed.length, output);
     }
 
+    /** Cached end offset of the last decompressed term — avoids offset lookup for sequential access. */
+    private long nextStart = -1;
+    private long lastDecompressedOrd = -1;
+
     private void decompressTerm(long ord) throws IOException {
-      long start = termOffsets.get(ord);
-      long end = termOffsets.get(ord + 1);
-      int compressedLen = (int) (end - start);
-      if (compressedBuf.length < compressedLen) {
-        // should not happen with proper maxTermLength, but be safe
+      long start;
+      if (ord == lastDecompressedOrd + 1 && nextStart >= 0) {
+        // Sequential access: reuse cached end offset as start
+        start = nextStart;
+      } else {
+        start = termOffsets.get(ord);
       }
+      long end = termOffsets.get(ord + 1);
+      nextStart = end;
+      lastDecompressedOrd = ord;
+      int compressedLen = (int) (end - start);
       bytes.seek(start);
       bytes.readBytes(compressedBuf, 0, compressedLen);
       term.length =
@@ -1954,7 +1963,8 @@ final class Lucene90DocValuesProducer extends DocValuesProducer {
 
     @Override
     public BytesRef next() throws IOException {
-      if (++ord >= termsDictSize) return null;
+      ++ord;
+      if (ord >= termsDictSize) return null;
       decompressTerm(ord);
       return term;
     }

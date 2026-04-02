@@ -136,10 +136,12 @@ public class FSSTDocValuesBenchmark {
 
     // Measure file sizes
     long dvdSize = 0, dvmSize = 0;
-    for (var f : Files.list(tempDir).toList()) {
-      String name = f.getFileName().toString();
-      if (name.endsWith(".dvd")) dvdSize += Files.size(f);
-      if (name.endsWith(".dvm")) dvmSize += Files.size(f);
+    try (var stream = Files.walk(tempDir)) {
+      for (var f : stream.toList()) {
+        String name = f.getFileName().toString();
+        if (name.endsWith(".dvd")) dvdSize += Files.size(f);
+        if (name.endsWith(".dvm")) dvmSize += Files.size(f);
+      }
     }
 
     reader = DirectoryReader.open(directory);
