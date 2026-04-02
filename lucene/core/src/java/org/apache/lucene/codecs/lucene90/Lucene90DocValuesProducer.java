@@ -304,8 +304,23 @@ final class Lucene90DocValuesProducer extends DocValuesProducer {
     return entry;
   }
 
-  private static void readTermDict(IndexInput meta, TermsDictEntry entry) throws IOException {
+  private void readTermDict(IndexInput meta, TermsDictEntry entry) throws IOException {
     entry.termsDictSize = meta.readVLong();
+
+    if (version >= Lucene90DocValuesFormat.VERSION_FSST) {
+      entry.encoding = meta.readByte();
+    } else {
+      entry.encoding = Lucene90DocValuesConsumer.TERMS_DICT_LZ4;
+    }
+
+    if (entry.encoding == Lucene90DocValuesConsumer.TERMS_DICT_FSST) {
+      readTermDictFSST(meta, entry);
+    } else {
+      readTermDictLZ4(meta, entry);
+    }
+  }
+
+  private static void readTermDictLZ4(IndexInput meta, TermsDictEntry entry) throws IOException {
     final int blockShift = meta.readInt();
     final long addressesSize =
         (entry.termsDictSize + (1L << TERMS_DICT_BLOCK_LZ4_SHIFT) - 1)
@@ -317,6 +332,27 @@ final class Lucene90DocValuesProducer extends DocValuesProducer {
     entry.termsDataLength = meta.readLong();
     entry.termsAddressesOffset = meta.readLong();
     entry.termsAddressesLength = meta.readLong();
+    entry.termsDictIndexShift = meta.readInt();
+    final long indexSize =
+        (entry.termsDictSize + (1L << entry.termsDictIndexShift) - 1) >>> entry.termsDictIndexShift;
+    entry.termsIndexAddressesMeta = DirectMonotonicReader.loadMeta(meta, 1 + indexSize, blockShift);
+    entry.termsIndexOffset = meta.readLong();
+    entry.termsIndexLength = meta.readLong();
+    entry.termsIndexAddressesOffset = meta.readLong();
+    entry.termsIndexAddressesLength = meta.readLong();
+  }
+
+  private static void readTermDictFSST(IndexInput meta, TermsDictEntry entry) throws IOException {
+    entry.symbolTableLength = meta.readVInt();
+    final int blockShift = meta.readInt();
+    entry.termsAddressesMeta =
+        DirectMonotonicReader.loadMeta(meta, entry.termsDictSize + 1, blockShift);
+    entry.maxTermLength = meta.readInt();
+    entry.termsDataOffset = meta.readLong();
+    entry.termsDataLength = meta.readLong();
+    entry.termsAddressesOffset = meta.readLong();
+    entry.termsAddressesLength = meta.readLong();
+    // Reverse index
     entry.termsDictIndexShift = meta.readInt();
     final long indexSize =
         (entry.termsDictSize + (1L << entry.termsDictIndexShift) - 1) >>> entry.termsDictIndexShift;
@@ -387,6 +423,7 @@ final class Lucene90DocValuesProducer extends DocValuesProducer {
   }
 
   private static class TermsDictEntry {
+    byte encoding; // TERMS_DICT_LZ4 or TERMS_DICT_FSST
     long termsDictSize;
     DirectMonotonicReader.Meta termsAddressesMeta;
     int maxTermLength;
@@ -401,7 +438,11 @@ final class Lucene90DocValuesProducer extends DocValuesProducer {
     long termsIndexAddressesOffset;
     long termsIndexAddressesLength;
 
+    // LZ4-specific
     int maxBlockLength;
+
+    // FSST-specific
+    int symbolTableLength;
   }
 
   private static class SortedEntry {
@@ -1075,14 +1116,22 @@ final class Lucene90DocValuesProducer extends DocValuesProducer {
     };
   }
 
-  private abstract class BaseSortedDocValues extends SortedDocValues {
+  private abstract class BaseSortedDocValues extends SortedDocValues
+      implements org.apache.lucene.codecs.lucene90.fsst.FSSTCompressedAccess {
 
     final SortedEntry entry;
     final TermsEnum termsEnum;
+    final FSSTTermsDict fsstTermsDict; // null if LZ4
 
     BaseSortedDocValues(SortedEntry entry) throws IOException {
       this.entry = entry;
-      this.termsEnum = termsEnum();
+      if (entry.termsDictEntry.encoding == Lucene90DocValuesConsumer.TERMS_DICT_FSST) {
+        this.fsstTermsDict = new FSSTTermsDict(entry.termsDictEntry, data);
+        this.termsEnum = fsstTermsDict;
+      } else {
+        this.fsstTermsDict = null;
+        this.termsEnum = new TermsDict(entry.termsDictEntry, data);
+      }
     }
 
     @Override
@@ -1111,20 +1160,46 @@ final class Lucene90DocValuesProducer extends DocValuesProducer {
 
     @Override
     public TermsEnum termsEnum() throws IOException {
+      if (entry.termsDictEntry.encoding == Lucene90DocValuesConsumer.TERMS_DICT_FSST) {
+        return new FSSTTermsDict(entry.termsDictEntry, data);
+      }
       return new TermsDict(entry.termsDictEntry, data);
+    }
+
+    @Override
+    public boolean hasCompressedAccess() {
+      return fsstTermsDict != null;
+    }
+
+    @Override
+    public BytesRef lookupCompressedOrd(long ord) throws IOException {
+      return fsstTermsDict.lookupCompressedOrd(ord);
+    }
+
+    @Override
+    public int decompress(BytesRef compressed, byte[] output) throws IOException {
+      return fsstTermsDict.decompress(compressed, output);
     }
   }
 
-  private abstract class BaseSortedSetDocValues extends SortedSetDocValues {
+  private abstract class BaseSortedSetDocValues extends SortedSetDocValues
+      implements org.apache.lucene.codecs.lucene90.fsst.FSSTCompressedAccess {
 
     final SortedSetEntry entry;
     final IndexInput data;
     final TermsEnum termsEnum;
+    final FSSTTermsDict fsstTermsDict;
 
     BaseSortedSetDocValues(SortedSetEntry entry, IndexInput data) throws IOException {
       this.entry = entry;
       this.data = data;
-      this.termsEnum = termsEnum();
+      if (entry.termsDictEntry.encoding == Lucene90DocValuesConsumer.TERMS_DICT_FSST) {
+        this.fsstTermsDict = new FSSTTermsDict(entry.termsDictEntry, data);
+        this.termsEnum = fsstTermsDict;
+      } else {
+        this.fsstTermsDict = null;
+        this.termsEnum = new TermsDict(entry.termsDictEntry, data);
+      }
     }
 
     @Override
@@ -1153,7 +1228,25 @@ final class Lucene90DocValuesProducer extends DocValuesProducer {
 
     @Override
     public TermsEnum termsEnum() throws IOException {
+      if (entry.termsDictEntry.encoding == Lucene90DocValuesConsumer.TERMS_DICT_FSST) {
+        return new FSSTTermsDict(entry.termsDictEntry, data);
+      }
       return new TermsDict(entry.termsDictEntry, data);
+    }
+
+    @Override
+    public boolean hasCompressedAccess() {
+      return fsstTermsDict != null;
+    }
+
+    @Override
+    public BytesRef lookupCompressedOrd(long ord) throws IOException {
+      return fsstTermsDict.lookupCompressedOrd(ord);
+    }
+
+    @Override
+    public int decompress(BytesRef compressed, byte[] output) throws IOException {
+      return fsstTermsDict.decompress(compressed, output);
     }
   }
 
@@ -1784,6 +1877,150 @@ final class Lucene90DocValuesProducer extends DocValuesProducer {
   @Override
   public void checkIntegrity() throws IOException {
     CodecUtil.checksumEntireFile(data);
+  }
+
+  /** Reads FSST-compressed terms with O(1) random access via per-term offsets. */
+  private class FSSTTermsDict extends BaseTermsEnum
+      implements org.apache.lucene.codecs.lucene90.fsst.FSSTCompressedAccess {
+    final long termsDictSize;
+    final LongValues termOffsets;
+    final IndexInput bytes;
+    final org.apache.lucene.codecs.lucene90.fsst.FSSTDecompressor decompressor;
+    final BytesRef term;
+    final byte[] compressedBuf;
+    final BytesRef compressedTerm;
+    long ord = -1;
+
+    FSSTTermsDict(TermsDictEntry entry, IndexInput data) throws IOException {
+      this.termsDictSize = entry.termsDictSize;
+
+      // Read symbol table from data
+      IndexInput dataSlice =
+          data.slice("fsst-terms", entry.termsDataOffset - entry.symbolTableLength,
+              entry.termsDataLength + entry.symbolTableLength);
+      byte[] tableBytes = new byte[entry.symbolTableLength];
+      dataSlice.readBytes(tableBytes, 0, tableBytes.length);
+      org.apache.lucene.codecs.lucene90.fsst.FSSTSymbolTable symbolTable =
+          org.apache.lucene.codecs.lucene90.fsst.FSSTSymbolTable.load(tableBytes);
+      this.decompressor = new org.apache.lucene.codecs.lucene90.fsst.FSSTDecompressor(symbolTable);
+
+      // Per-term offsets
+      RandomAccessInput addrSlice =
+          data.randomAccessSlice(entry.termsAddressesOffset, entry.termsAddressesLength);
+      termOffsets =
+          DirectMonotonicReader.getInstance(entry.termsAddressesMeta, addrSlice, false);
+      bytes = data.slice("fsst-terms-data", entry.termsDataOffset, entry.termsDataLength);
+      term = new BytesRef(entry.maxTermLength);
+      compressedBuf = new byte[entry.maxTermLength * 2];
+      compressedTerm = new BytesRef(entry.maxTermLength * 2);
+    }
+
+    @Override
+    public boolean hasCompressedAccess() {
+      return true;
+    }
+
+    @Override
+    public BytesRef lookupCompressedOrd(long ord) throws IOException {
+      long start = termOffsets.get(ord);
+      long end = termOffsets.get(ord + 1);
+      int len = (int) (end - start);
+      if (compressedTerm.bytes.length < len) compressedTerm.bytes = new byte[len];
+      bytes.seek(start);
+      bytes.readBytes(compressedTerm.bytes, 0, len);
+      compressedTerm.offset = 0;
+      compressedTerm.length = len;
+      return compressedTerm;
+    }
+
+    @Override
+    public int decompress(BytesRef compressed, byte[] output) throws IOException {
+      return decompressor.decompress(
+          compressed.bytes, compressed.offset, compressed.length, output);
+    }
+
+    private void decompressTerm(long ord) throws IOException {
+      long start = termOffsets.get(ord);
+      long end = termOffsets.get(ord + 1);
+      int compressedLen = (int) (end - start);
+      if (compressedBuf.length < compressedLen) {
+        // should not happen with proper maxTermLength, but be safe
+      }
+      bytes.seek(start);
+      bytes.readBytes(compressedBuf, 0, compressedLen);
+      term.length =
+          decompressor.decompress(compressedBuf, 0, compressedLen, term.bytes);
+    }
+
+    @Override
+    public BytesRef next() throws IOException {
+      if (++ord >= termsDictSize) return null;
+      decompressTerm(ord);
+      return term;
+    }
+
+    @Override
+    public void seekExact(long ord) throws IOException {
+      this.ord = ord;
+      decompressTerm(ord);
+    }
+
+    @Override
+    public SeekStatus seekCeil(BytesRef text) throws IOException {
+      // Binary search using the reverse index would be better,
+      // but linear scan is acceptable for prototype
+      long lo = 0, hi = termsDictSize - 1;
+      while (lo <= hi) {
+        long mid = (lo + hi) >>> 1;
+        decompressTerm(mid);
+        int cmp = term.compareTo(text);
+        if (cmp < 0) {
+          lo = mid + 1;
+        } else if (cmp > 0) {
+          hi = mid - 1;
+        } else {
+          ord = mid;
+          return SeekStatus.FOUND;
+        }
+      }
+      if (lo >= termsDictSize) {
+        ord = termsDictSize;
+        return SeekStatus.END;
+      }
+      ord = lo;
+      decompressTerm(ord);
+      return SeekStatus.NOT_FOUND;
+    }
+
+    @Override
+    public BytesRef term() {
+      return term;
+    }
+
+    @Override
+    public long ord() {
+      return ord;
+    }
+
+    @Override
+    public long totalTermFreq() {
+      return -1L;
+    }
+
+    @Override
+    public PostingsEnum postings(PostingsEnum reuse, int flags) {
+      throw new UnsupportedOperationException();
+    }
+
+    @Override
+    public ImpactsEnum impacts(int flags) {
+      throw new UnsupportedOperationException();
+    }
+
+    @Override
+    public int docFreq() {
+      throw new UnsupportedOperationException();
+    }
   }
 
   /**
