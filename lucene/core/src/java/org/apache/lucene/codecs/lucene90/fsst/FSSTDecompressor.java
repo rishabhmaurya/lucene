@@ -29,20 +29,47 @@ public final class FSSTDecompressor {
   }
 
   /**
-   * Decompresses {@code compressed[off..off+len)} into {@code output}.
+   * Decompresses {@code compressed[off..off+len)} into {@code output}. Uses pre-decoded long values
+   * to write up to 8 symbol bytes with a single store, avoiding per-symbol arraycopy.
    *
    * @return the number of decompressed bytes written to output
    */
   public int decompress(byte[] compressed, int off, int len, byte[] output) {
+    final byte[] symbolLen = table.len;
+    final long[] decodeLong = table.decodeLong;
     int pos = off, end = off + len, outPos = 0;
     while (pos < end) {
       int code = compressed[pos++] & 0xFF;
       if (code != FSSTSymbolTable.ESCAPE) {
-        outPos += table.symbolBytes(code, output, outPos);
+        int l = symbolLen[code] & 0xFF;
+        long v = decodeLong[code];
+        // Write up to 8 bytes — we always write 8 but only advance by symbol length.
+        // Caller must ensure output has at least 7 bytes of slack beyond actual decompressed size.
+        if (outPos + 8 <= output.length) {
+          writeLongLE(output, outPos, v);
+        } else {
+          // Fallback for last few bytes
+          for (int i = 0; i < l; i++) {
+            output[outPos + i] = (byte) (v >>> (i * 8));
+          }
+        }
+        outPos += l;
       } else {
         output[outPos++] = compressed[pos++];
       }
     }
     return outPos;
+  }
+
+  /** Write a long in little-endian order to a byte array. */
+  private static void writeLongLE(byte[] b, int off, long v) {
+    b[off] = (byte) v;
+    b[off + 1] = (byte) (v >>> 8);
+    b[off + 2] = (byte) (v >>> 16);
+    b[off + 3] = (byte) (v >>> 24);
+    b[off + 4] = (byte) (v >>> 32);
+    b[off + 5] = (byte) (v >>> 40);
+    b[off + 6] = (byte) (v >>> 48);
+    b[off + 7] = (byte) (v >>> 56);
   }
 }

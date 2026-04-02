@@ -1910,7 +1910,7 @@ final class Lucene90DocValuesProducer extends DocValuesProducer {
       termOffsets =
           DirectMonotonicReader.getInstance(entry.termsAddressesMeta, addrSlice, false);
       bytes = data.slice("fsst-terms-data", entry.termsDataOffset, entry.termsDataLength);
-      term = new BytesRef(entry.maxTermLength);
+      term = new BytesRef(entry.maxTermLength + 7); // +7 slack for long-based decompression
       compressedBuf = new byte[entry.maxTermLength * 2];
       compressedTerm = new BytesRef(entry.maxTermLength * 2);
     }

@@ -41,8 +41,10 @@ public final class FSSTSymbolTable {
   /** Serialized size in bytes: 255 lengths + 255 × 8 symbol bytes. */
   public static final int SERIALIZED_SIZE = MAX_SYMBOLS + MAX_SYMBOLS * 8;
 
-  private final byte[] len = new byte[MAX_SYMBOLS];
+  final byte[] len = new byte[MAX_SYMBOLS];
   private final byte[] symbols = new byte[MAX_SYMBOLS * 8];
+  /** Pre-decoded symbols as longs for fast decompression — avoids arraycopy per symbol. */
+  final long[] decodeLong = new long[MAX_SYMBOLS];
 
   private FSSTSymbolTable() {}
 
@@ -60,6 +62,16 @@ public final class FSSTSymbolTable {
     FSSTSymbolTable t = new FSSTSymbolTable();
     System.arraycopy(data, 0, t.len, 0, MAX_SYMBOLS);
     System.arraycopy(data, MAX_SYMBOLS, t.symbols, 0, MAX_SYMBOLS * 8);
+    // Pre-decode symbols as little-endian longs for fast decompression
+    for (int i = 0; i < MAX_SYMBOLS; i++) {
+      long v = 0;
+      int base = i * 8;
+      int l = t.len[i] & 0xFF;
+      for (int j = 0; j < l; j++) {
+        v |= (long) (t.symbols[base + j] & 0xFF) << (j * 8);
+      }
+      t.decodeLong[i] = v;
+    }
     return t;
   }
 
