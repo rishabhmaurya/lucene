@@ -122,6 +122,7 @@ public class FSSTDocValuesBenchmark {
     long rawBytes = 0;
     long indexStart = System.nanoTime();
     IndexWriterConfig conf = new IndexWriterConfig().setCodec(codec);
+    conf.setUseCompoundFile(false); // separate files for size measurement
     try (IndexWriter writer = new IndexWriter(directory, conf)) {
       for (String term : terms) {
         Document doc = new Document();
