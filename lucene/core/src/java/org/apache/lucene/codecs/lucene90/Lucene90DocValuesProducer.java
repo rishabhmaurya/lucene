@@ -1944,11 +1944,55 @@ final class Lucene90DocValuesProducer extends DocValuesProducer {
           compressed.bytes, compressed.offset, compressed.length, output);
     }
 
-    /** Sequential decompression — reads length prefix + compressed bytes, no offset lookup. */
+    /** Buffered read-ahead for sequential access — avoids per-term mmap reads. */
+    private static final int SEQ_BUF_SIZE = 4096;
+    private final byte[] seqBuf = new byte[SEQ_BUF_SIZE];
+    private int seqBufPos = 0;
+    private int seqBufLen = 0;
+
+    private void fillSeqBuf() throws IOException {
+      // Shift remaining bytes to front
+      int remaining = seqBufLen - seqBufPos;
+      if (remaining > 0) {
+        System.arraycopy(seqBuf, seqBufPos, seqBuf, 0, remaining);
+      }
+      seqBufPos = 0;
+      // Fill rest from mmap
+      int toRead = Math.min(SEQ_BUF_SIZE - remaining, (int) (seqBytes.length() - seqBytes.getFilePointer()));
+      if (toRead > 0) {
+        seqBytes.readBytes(seqBuf, remaining, toRead);
+      }
+      seqBufLen = remaining + toRead;
+    }
+
+    private int readVIntFromBuf() throws IOException {
+      if (seqBufPos >= seqBufLen) fillSeqBuf();
+      byte b = seqBuf[seqBufPos++];
+      if (b >= 0) return b;
+      int i = b & 0x7F;
+      if (seqBufPos >= seqBufLen) fillSeqBuf();
+      b = seqBuf[seqBufPos++];
+      i |= (b & 0x7F) << 7;
+      if (b >= 0) return i;
+      if (seqBufPos >= seqBufLen) fillSeqBuf();
+      b = seqBuf[seqBufPos++];
+      i |= (b & 0x7F) << 14;
+      if (b >= 0) return i;
+      if (seqBufPos >= seqBufLen) fillSeqBuf();
+      b = seqBuf[seqBufPos++];
+      i |= (b & 0x7F) << 21;
+      if (b >= 0) return i;
+      if (seqBufPos >= seqBufLen) fillSeqBuf();
+      b = seqBuf[seqBufPos++];
+      return i | ((b & 0x7F) << 28);
+    }
+
+    /** Sequential decompression — reads from buffered heap array, no offset lookup, no per-term mmap. */
     private void decompressTermSequential() throws IOException {
-      int compLen = seqBytes.readVInt();
-      seqBytes.readBytes(compressedBuf, 0, compLen);
-      term.length = decompressor.decompress(compressedBuf, 0, compLen, term.bytes);
+      int compLen = readVIntFromBuf();
+      if (seqBufPos + compLen > seqBufLen) fillSeqBuf();
+      term.length = decompressor.decompress(seqBuf, seqBufPos, compLen, term.bytes);
+      seqBufPos += compLen;
     }
 
     /** Random access decompression — uses offset lookup. Also positions seqBytes for subsequent sequential reads. */
@@ -1958,8 +2002,10 @@ final class Lucene90DocValuesProducer extends DocValuesProducer {
       int compLen = bytes.readVInt();
       bytes.readBytes(compressedBuf, 0, compLen);
       term.length = decompressor.decompress(compressedBuf, 0, compLen, term.bytes);
-      // Position seqBytes right after this term so next sequential read works
+      // Position seqBytes right after this term and invalidate buffer
       seqBytes.seek(bytes.getFilePointer());
+      seqBufPos = 0;
+      seqBufLen = 0;
     }
 
     @Override
