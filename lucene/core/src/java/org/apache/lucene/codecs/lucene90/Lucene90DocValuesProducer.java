@@ -1883,12 +1883,15 @@ final class Lucene90DocValuesProducer extends DocValuesProducer {
   private class FSSTTermsDict extends BaseTermsEnum
       implements org.apache.lucene.codecs.lucene90.fsst.FSSTCompressedAccess {
     final long termsDictSize;
-    final int[] termOffsets; // heap-resident offset array — eliminates DirectMonotonicReader
-    final byte[] termsData; // heap-resident compressed terms — eliminates mmap overhead
+    final LongValues termOffsets; // for random access via DirectMonotonicReader
+    final IndexInput bytes; // mmap slice for random access
+    final IndexInput seqBytes; // separate mmap slice for sequential scan
     final org.apache.lucene.codecs.lucene90.fsst.FSSTDecompressor decompressor;
     final BytesRef term;
+    final byte[] compressedBuf;
     final BytesRef compressedTerm;
     long ord = -1;
+    long seqOrd = -2; // -2 so that seekExact(0) doesn't match seqOrd+1 initially
 
     FSSTTermsDict(TermsDictEntry entry, IndexInput data) throws IOException {
       this.termsDictSize = entry.termsDictSize;
@@ -1903,22 +1906,18 @@ final class Lucene90DocValuesProducer extends DocValuesProducer {
           org.apache.lucene.codecs.lucene90.fsst.FSSTSymbolTable.load(tableBytes);
       this.decompressor = new org.apache.lucene.codecs.lucene90.fsst.FSSTDecompressor(symbolTable);
 
-      // Load compressed terms data into heap
-      termsData = new byte[(int) entry.termsDataLength];
-      IndexInput termsSlice = data.slice("fsst-terms-data", entry.termsDataOffset, entry.termsDataLength);
-      termsSlice.readBytes(termsData, 0, termsData.length);
+      // mmap slices for random and sequential access
+      bytes = data.slice("fsst-terms-data", entry.termsDataOffset, entry.termsDataLength);
+      seqBytes = bytes.clone();
 
-      // Load per-term offsets into heap int array
+      // DirectMonotonicReader for random access offsets
       RandomAccessInput addrSlice =
           data.randomAccessSlice(entry.termsAddressesOffset, entry.termsAddressesLength);
-      LongValues dmOffsets =
+      termOffsets =
           DirectMonotonicReader.getInstance(entry.termsAddressesMeta, addrSlice, false);
-      termOffsets = new int[(int) (termsDictSize + 1)];
-      for (int i = 0; i <= termsDictSize; i++) {
-        termOffsets[i] = (int) dmOffsets.get(i);
-      }
 
-      term = new BytesRef(entry.maxTermLength + 7); // +7 slack for long-based decompression
+      term = new BytesRef(entry.maxTermLength + 7);
+      compressedBuf = new byte[entry.maxTermLength * 2];
       compressedTerm = new BytesRef(entry.maxTermLength * 2);
     }
 
@@ -1929,11 +1928,13 @@ final class Lucene90DocValuesProducer extends DocValuesProducer {
 
     @Override
     public BytesRef lookupCompressedOrd(long ord) throws IOException {
-      int start = termOffsets[(int) ord];
-      int len = termOffsets[(int) ord + 1] - start;
-      compressedTerm.bytes = termsData;
-      compressedTerm.offset = start;
-      compressedTerm.length = len;
+      long start = termOffsets.get(ord);
+      bytes.seek(start);
+      int compLen = bytes.readVInt();
+      if (compressedTerm.bytes.length < compLen) compressedTerm.bytes = new byte[compLen];
+      bytes.readBytes(compressedTerm.bytes, 0, compLen);
+      compressedTerm.offset = 0;
+      compressedTerm.length = compLen;
       return compressedTerm;
     }
 
@@ -1943,25 +1944,48 @@ final class Lucene90DocValuesProducer extends DocValuesProducer {
           compressed.bytes, compressed.offset, compressed.length, output);
     }
 
-    private void decompressTerm(long ord) throws IOException {
-      int start = termOffsets[(int) ord];
-      int compressedLen = termOffsets[(int) ord + 1] - start;
-      term.length =
-          decompressor.decompress(termsData, start, compressedLen, term.bytes);
+    /** Sequential decompression — reads length prefix + compressed bytes, no offset lookup. */
+    private void decompressTermSequential() throws IOException {
+      int compLen = seqBytes.readVInt();
+      seqBytes.readBytes(compressedBuf, 0, compLen);
+      term.length = decompressor.decompress(compressedBuf, 0, compLen, term.bytes);
+    }
+
+    /** Random access decompression — uses offset lookup. Also positions seqBytes for subsequent sequential reads. */
+    private void decompressTermRandom(long ord) throws IOException {
+      long start = termOffsets.get(ord);
+      bytes.seek(start);
+      int compLen = bytes.readVInt();
+      bytes.readBytes(compressedBuf, 0, compLen);
+      term.length = decompressor.decompress(compressedBuf, 0, compLen, term.bytes);
+      // Position seqBytes right after this term so next sequential read works
+      seqBytes.seek(bytes.getFilePointer());
     }
 
     @Override
     public BytesRef next() throws IOException {
       ++ord;
       if (ord >= termsDictSize) return null;
-      decompressTerm(ord);
+      if (ord == seqOrd + 1) {
+        // Sequential: just read next length-prefixed term, no offset lookup
+        decompressTermSequential();
+      } else {
+        // Random jump: seek via offsets, then read
+        decompressTermRandom(ord);
+      }
+      seqOrd = ord;
       return term;
     }
 
     @Override
     public void seekExact(long ord) throws IOException {
       this.ord = ord;
-      decompressTerm(ord);
+      if (ord == seqOrd + 1) {
+        decompressTermSequential();
+      } else {
+        decompressTermRandom(ord);
+      }
+      seqOrd = ord;
     }
 
     @Override
@@ -1971,7 +1995,7 @@ final class Lucene90DocValuesProducer extends DocValuesProducer {
       long lo = 0, hi = termsDictSize - 1;
       while (lo <= hi) {
         long mid = (lo + hi) >>> 1;
-        decompressTerm(mid);
+        decompressTermRandom(mid);
         int cmp = term.compareTo(text);
         if (cmp < 0) {
           lo = mid + 1;
@@ -1979,6 +2003,7 @@ final class Lucene90DocValuesProducer extends DocValuesProducer {
           hi = mid - 1;
         } else {
           ord = mid;
+          seqOrd = mid;
           return SeekStatus.FOUND;
         }
       }
@@ -1987,7 +2012,8 @@ final class Lucene90DocValuesProducer extends DocValuesProducer {
         return SeekStatus.END;
       }
       ord = lo;
-      decompressTerm(ord);
+      seqOrd = lo;
+      decompressTermRandom(ord);
       return SeekStatus.NOT_FOUND;
     }
 
