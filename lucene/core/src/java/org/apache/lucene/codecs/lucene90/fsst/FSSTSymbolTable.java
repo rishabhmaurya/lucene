@@ -41,10 +41,11 @@ public final class FSSTSymbolTable {
   /** Serialized size in bytes: 255 lengths + 255 × 8 symbol bytes. */
   public static final int SERIALIZED_SIZE = MAX_SYMBOLS + MAX_SYMBOLS * 8;
 
-  final byte[] len = new byte[MAX_SYMBOLS];
+  /** Symbol lengths — public for inlined decompression in hot paths. */
+  public final byte[] len = new byte[MAX_SYMBOLS];
   private final byte[] symbols = new byte[MAX_SYMBOLS * 8];
-  /** Pre-decoded symbols as longs for fast decompression — avoids arraycopy per symbol. */
-  final long[] decodeLong = new long[MAX_SYMBOLS];
+  /** Pre-decoded symbols as longs for fast decompression. Public for inlined hot paths. */
+  public final long[] decodeLong = new long[MAX_SYMBOLS];
 
   private FSSTSymbolTable() {}
 

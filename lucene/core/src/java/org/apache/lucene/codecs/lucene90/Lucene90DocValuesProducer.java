@@ -49,6 +49,7 @@ import org.apache.lucene.store.DataInput;
 import org.apache.lucene.store.FileTypeHint;
 import org.apache.lucene.store.IndexInput;
 import org.apache.lucene.store.RandomAccessInput;
+import org.apache.lucene.util.BitUtil;
 import org.apache.lucene.util.BytesRef;
 import org.apache.lucene.util.FixedBitSet;
 import org.apache.lucene.util.IOUtils;
@@ -1987,12 +1988,30 @@ final class Lucene90DocValuesProducer extends DocValuesProducer {
       return i | ((b & 0x7F) << 28);
     }
 
-    /** Sequential decompression — reads from buffered heap array, no offset lookup, no per-term mmap. */
+    /** Sequential decompression — inlined from seqBuf, no method call overhead per term. */
     private void decompressTermSequential() throws IOException {
       int compLen = readVIntFromBuf();
       if (seqBufPos + compLen > seqBufLen) fillSeqBuf();
-      term.length = decompressor.decompress(seqBuf, seqBufPos, compLen, term.bytes);
-      seqBufPos += compLen;
+
+      // Inline decompression from seqBuf directly — avoids per-term method call overhead
+      final byte[] symbolLen = decompressor.symbolTable().len;
+      final long[] symbol = decompressor.symbolTable().decodeLong;
+      final byte[] out = term.bytes;
+      final byte[] in = seqBuf;
+      int pos = seqBufPos;
+      int end = pos + compLen;
+      int outPos = 0;
+      while (pos < end) {
+        int code = in[pos++] & 0xFF;
+        if (code != 0xFF) {
+          BitUtil.VH_LE_LONG.set(out, outPos, symbol[code]);
+          outPos += symbolLen[code] & 0xFF;
+        } else {
+          out[outPos++] = in[pos++];
+        }
+      }
+      term.length = outPos;
+      seqBufPos = end;
     }
 
     /** Random access decompression — uses offset lookup. Also positions seqBytes for subsequent sequential reads. */

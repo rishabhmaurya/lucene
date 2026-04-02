@@ -26,6 +26,11 @@ public final class FSSTDecompressor {
 
   private final FSSTSymbolTable table;
 
+  /** Expose symbol table for inlined decompression in hot paths. */
+  public FSSTSymbolTable symbolTable() {
+    return table;
+  }
+
   public FSSTDecompressor(FSSTSymbolTable table) {
     this.table = table;
   }
