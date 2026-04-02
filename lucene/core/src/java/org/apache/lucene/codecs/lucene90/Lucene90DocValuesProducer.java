@@ -1883,11 +1883,10 @@ final class Lucene90DocValuesProducer extends DocValuesProducer {
   private class FSSTTermsDict extends BaseTermsEnum
       implements org.apache.lucene.codecs.lucene90.fsst.FSSTCompressedAccess {
     final long termsDictSize;
-    final LongValues termOffsets;
-    final IndexInput bytes;
+    final int[] termOffsets; // heap-resident offset array — eliminates DirectMonotonicReader
+    final byte[] termsData; // heap-resident compressed terms — eliminates mmap overhead
     final org.apache.lucene.codecs.lucene90.fsst.FSSTDecompressor decompressor;
     final BytesRef term;
-    final byte[] compressedBuf;
     final BytesRef compressedTerm;
     long ord = -1;
 
@@ -1904,14 +1903,22 @@ final class Lucene90DocValuesProducer extends DocValuesProducer {
           org.apache.lucene.codecs.lucene90.fsst.FSSTSymbolTable.load(tableBytes);
       this.decompressor = new org.apache.lucene.codecs.lucene90.fsst.FSSTDecompressor(symbolTable);
 
-      // Per-term offsets
+      // Load compressed terms data into heap
+      termsData = new byte[(int) entry.termsDataLength];
+      IndexInput termsSlice = data.slice("fsst-terms-data", entry.termsDataOffset, entry.termsDataLength);
+      termsSlice.readBytes(termsData, 0, termsData.length);
+
+      // Load per-term offsets into heap int array
       RandomAccessInput addrSlice =
           data.randomAccessSlice(entry.termsAddressesOffset, entry.termsAddressesLength);
-      termOffsets =
+      LongValues dmOffsets =
           DirectMonotonicReader.getInstance(entry.termsAddressesMeta, addrSlice, false);
-      bytes = data.slice("fsst-terms-data", entry.termsDataOffset, entry.termsDataLength);
+      termOffsets = new int[(int) (termsDictSize + 1)];
+      for (int i = 0; i <= termsDictSize; i++) {
+        termOffsets[i] = (int) dmOffsets.get(i);
+      }
+
       term = new BytesRef(entry.maxTermLength + 7); // +7 slack for long-based decompression
-      compressedBuf = new byte[entry.maxTermLength * 2];
       compressedTerm = new BytesRef(entry.maxTermLength * 2);
     }
 
@@ -1922,13 +1929,10 @@ final class Lucene90DocValuesProducer extends DocValuesProducer {
 
     @Override
     public BytesRef lookupCompressedOrd(long ord) throws IOException {
-      long start = termOffsets.get(ord);
-      long end = termOffsets.get(ord + 1);
-      int len = (int) (end - start);
-      if (compressedTerm.bytes.length < len) compressedTerm.bytes = new byte[len];
-      bytes.seek(start);
-      bytes.readBytes(compressedTerm.bytes, 0, len);
-      compressedTerm.offset = 0;
+      int start = termOffsets[(int) ord];
+      int len = termOffsets[(int) ord + 1] - start;
+      compressedTerm.bytes = termsData;
+      compressedTerm.offset = start;
       compressedTerm.length = len;
       return compressedTerm;
     }
@@ -1939,26 +1943,11 @@ final class Lucene90DocValuesProducer extends DocValuesProducer {
           compressed.bytes, compressed.offset, compressed.length, output);
     }
 
-    /** Cached end offset of the last decompressed term — avoids offset lookup for sequential access. */
-    private long nextStart = -1;
-    private long lastDecompressedOrd = -1;
-
     private void decompressTerm(long ord) throws IOException {
-      long start;
-      if (ord == lastDecompressedOrd + 1 && nextStart >= 0) {
-        // Sequential access: reuse cached end offset as start
-        start = nextStart;
-      } else {
-        start = termOffsets.get(ord);
-      }
-      long end = termOffsets.get(ord + 1);
-      nextStart = end;
-      lastDecompressedOrd = ord;
-      int compressedLen = (int) (end - start);
-      bytes.seek(start);
-      bytes.readBytes(compressedBuf, 0, compressedLen);
+      int start = termOffsets[(int) ord];
+      int compressedLen = termOffsets[(int) ord + 1] - start;
       term.length =
-          decompressor.decompress(compressedBuf, 0, compressedLen, term.bytes);
+          decompressor.decompress(termsData, start, compressedLen, term.bytes);
     }
 
     @Override
