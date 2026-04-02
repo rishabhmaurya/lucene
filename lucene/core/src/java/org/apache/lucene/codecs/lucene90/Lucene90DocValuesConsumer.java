@@ -708,10 +708,19 @@ final class Lucene90DocValuesConsumer extends DocValuesConsumer {
       meta.writeByte((byte) 0); // multiValued (0 = singleValued)
     }
     writeValues(field, producer, true);
-    addTermsDict(DocValues.singleton(valuesProducer.getSorted(field)));
+    addTermsDict(DocValues.singleton(valuesProducer.getSorted(field)), field.name);
   }
 
-  private void addTermsDict(SortedSetDocValues values) throws IOException {
+  private void addTermsDict(SortedSetDocValues values, String fieldName) throws IOException {
+    java.nio.file.Path tablePath = Lucene90DocValuesFormat.symbolTablePathForField(fieldName);
+    if (tablePath != null && java.nio.file.Files.exists(tablePath)) {
+      addTermsDictFSST(values, tablePath);
+      return;
+    }
+    addTermsDictLZ4(values);
+  }
+
+  private void addTermsDictLZ4(SortedSetDocValues values) throws IOException {
     final long size = values.getValueCount();
     meta.writeVLong(size);
 
@@ -864,6 +873,59 @@ final class Lucene90DocValuesConsumer extends DocValuesConsumer {
     }
   }
 
+  private void addTermsDictFSST(SortedSetDocValues values, java.nio.file.Path tablePath) throws IOException {
+    final long size = values.getValueCount();
+    meta.writeVLong(size);
+
+    org.apache.lucene.codecs.lucene90.fsst.FSSTSymbolTable symbolTable =
+        org.apache.lucene.codecs.lucene90.fsst.FSSTSymbolTable.load(tablePath);
+    org.apache.lucene.codecs.lucene90.fsst.FSSTCompressor compressor =
+        new org.apache.lucene.codecs.lucene90.fsst.FSSTCompressor(symbolTable);
+
+    meta.writeByte(Lucene90DocValuesFormat.TERMS_DICT_ENCODING_FSST);
+
+    byte[] tableBytes = symbolTable.toBytes();
+    meta.writeVInt(tableBytes.length);
+    long symbolTableStart = data.getFilePointer();
+    data.writeBytes(tableBytes, 0, tableBytes.length);
+
+    meta.writeInt(DIRECT_MONOTONIC_BLOCK_SHIFT);
+    ByteBuffersDataOutput addressBuffer = new ByteBuffersDataOutput();
+    ByteBuffersIndexOutput addressOutput =
+        new ByteBuffersIndexOutput(addressBuffer, "temp", "temp");
+    DirectMonotonicWriter writer =
+        DirectMonotonicWriter.getInstance(
+            meta, addressOutput, size + 1, DIRECT_MONOTONIC_BLOCK_SHIFT);
+
+    int maxLength = 0;
+    TermsEnum iterator = values.termsEnum();
+    long start = data.getFilePointer();
+    byte[] compressBuf = new byte[65536];
+
+    for (BytesRef term = iterator.next(); term != null; term = iterator.next()) {
+      writer.add(data.getFilePointer() - start);
+      int compressedLen = compressor.compress(term.bytes, term.offset, term.length, compressBuf);
+      data.writeBytes(compressBuf, 0, compressedLen);
+      maxLength = Math.max(maxLength, term.length);
+    }
+    writer.add(data.getFilePointer() - start);
+    writer.finish();
+
+    meta.writeInt(maxLength);
+    meta.writeLong(start);
+    meta.writeLong(data.getFilePointer() - start);
+    start = data.getFilePointer();
+    addressBuffer.copyTo(data);
+    meta.writeLong(start);
+    meta.writeLong(data.getFilePointer() - start);
+
+    writeTermsIndex(values);
+
+    System.out.println("[FSST] Term dict: " + size + " terms, compressed data: "
+        + (data.getFilePointer() - symbolTableStart) + " bytes, symbol table: "
+        + tableBytes.length + " bytes");
+  }
+
   @Override
   public void addSortedNumericField(FieldInfo field, DocValuesProducer valuesProducer)
       throws IOException {
@@ -1004,6 +1066,6 @@ final class Lucene90DocValuesConsumer extends DocValuesConsumer {
         },
         true);
 
-    addTermsDict(valuesProducer.getSortedSet(field));
+    addTermsDict(valuesProducer.getSortedSet(field), field.name);
   }
 }

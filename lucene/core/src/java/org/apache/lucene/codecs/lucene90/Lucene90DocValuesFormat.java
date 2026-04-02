@@ -194,6 +194,23 @@ public final class Lucene90DocValuesFormat extends DocValuesFormat {
   static final int TERMS_DICT_REVERSE_INDEX_SIZE = 1 << TERMS_DICT_REVERSE_INDEX_SHIFT;
   static final int TERMS_DICT_REVERSE_INDEX_MASK = TERMS_DICT_REVERSE_INDEX_SIZE - 1;
 
+  // FSST encoding constants
+  static final byte TERMS_DICT_ENCODING_LZ4 = 0;
+  static final byte TERMS_DICT_ENCODING_FSST = 1;
+
+  /** System property to set base path for pre-built FSST symbol tables (one per field). */
+  public static final String FSST_SYMBOL_TABLE_PATH_PROP = "lucene.fsst.basePath";
+
+  static boolean useFSST() {
+    return System.getProperty(FSST_SYMBOL_TABLE_PATH_PROP) != null;
+  }
+
+  static java.nio.file.Path symbolTablePathForField(String fieldName) {
+    String basePath = System.getProperty(FSST_SYMBOL_TABLE_PATH_PROP);
+    if (basePath == null) return null;
+    return java.nio.file.Path.of(basePath, fieldName + ".fsst");
+  }
+
   // number of documents in an interval
   private static final int DEFAULT_SKIP_INDEX_INTERVAL_SIZE = 4096;
   // bytes on an interval:
