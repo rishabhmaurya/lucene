@@ -867,42 +867,37 @@ final class Lucene90DocValuesConsumer extends DocValuesConsumer {
     meta.writeVInt(tableBytes.length);
     data.writeBytes(tableBytes, 0, tableBytes.length);
 
-    // Per-term offsets
-    meta.writeInt(DIRECT_MONOTONIC_BLOCK_SHIFT);
-    ByteBuffersDataOutput addressBuffer = new ByteBuffersDataOutput();
-    ByteBuffersIndexOutput addressOutput =
-        new ByteBuffersIndexOutput(addressBuffer, "temp", "temp");
-    DirectMonotonicWriter writer =
-        DirectMonotonicWriter.getInstance(
-            meta, addressOutput, size + 1, DIRECT_MONOTONIC_BLOCK_SHIFT);
-
-    // Pass 2: compress each term and write with length prefix
+    // Pass 2: compress each term, collect offsets
     long start = data.getFilePointer();
     int maxTermLength = 0;
     byte[] compressBuf = new byte[65536];
+    int[] offsets = new int[(int) size + 1];
+    int termIdx = 0;
     {
       TermsEnum iterator = values.termsEnum();
       for (BytesRef term = iterator.next(); term != null; term = iterator.next()) {
-        writer.add(data.getFilePointer() - start);
+        offsets[termIdx++] = (int) (data.getFilePointer() - start);
         int compLen = compressor.compress(term.bytes, term.offset, term.length, compressBuf);
-        data.writeVInt(compLen); // length prefix for sequential scan
         data.writeBytes(compressBuf, 0, compLen);
         maxTermLength = Math.max(maxTermLength, term.length);
       }
     }
-    // Sentinel offset
-    writer.add(data.getFilePointer() - start);
-    writer.finish();
+    offsets[termIdx] = (int) (data.getFilePointer() - start);
 
     meta.writeInt(maxTermLength);
     meta.writeLong(start);
     meta.writeLong(data.getFilePointer() - start);
 
-    // Write address data
-    long addrStart = data.getFilePointer();
-    addressBuffer.copyTo(data);
-    meta.writeLong(addrStart);
-    meta.writeLong(data.getFilePointer() - addrStart);
+    // Write flat int offsets to data
+    long offsetsStart = data.getFilePointer();
+    for (int i = 0; i <= size; i++) {
+      data.writeInt(offsets[i]);
+    }
+    meta.writeLong(offsetsStart);
+    meta.writeLong(data.getFilePointer() - offsetsStart);
+
+    // Block shift for reverse index DirectMonotonic
+    meta.writeInt(DIRECT_MONOTONIC_BLOCK_SHIFT);
 
     // Reverse index (reuse existing method)
     writeTermsIndex(values);

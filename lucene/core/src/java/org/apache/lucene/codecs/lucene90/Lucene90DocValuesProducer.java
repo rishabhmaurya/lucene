@@ -345,15 +345,13 @@ final class Lucene90DocValuesProducer extends DocValuesProducer {
 
   private static void readTermDictFSST(IndexInput meta, TermsDictEntry entry) throws IOException {
     entry.symbolTableLength = meta.readVInt();
-    final int blockShift = meta.readInt();
-    entry.termsAddressesMeta =
-        DirectMonotonicReader.loadMeta(meta, entry.termsDictSize + 1, blockShift);
     entry.maxTermLength = meta.readInt();
     entry.termsDataOffset = meta.readLong();
     entry.termsDataLength = meta.readLong();
     entry.termsAddressesOffset = meta.readLong();
     entry.termsAddressesLength = meta.readLong();
     // Reverse index
+    final int blockShift = meta.readInt();
     entry.termsDictIndexShift = meta.readInt();
     final long indexSize =
         (entry.termsDictSize + (1L << entry.termsDictIndexShift) - 1) >>> entry.termsDictIndexShift;
@@ -1129,6 +1127,14 @@ final class Lucene90DocValuesProducer extends DocValuesProducer {
       if (entry.termsDictEntry.encoding == Lucene90DocValuesConsumer.TERMS_DICT_FSST) {
         this.fsstTermsDict = new FSSTTermsDict(entry.termsDictEntry, data);
         this.termsEnum = fsstTermsDict;
+        this.seqInput = fsstTermsDict.bytes.clone();
+        this.seqOffsets = fsstTermsDict.termOffsets;
+        this.seqDataEnd = fsstTermsDict.termOffsets[(int) fsstTermsDict.termsDictSize];
+        this.seqTerm = fsstTermsDict.term;
+        org.apache.lucene.codecs.lucene90.fsst.FSSTSymbolTable st = fsstTermsDict.decompressor.symbolTable();
+        this.seqSymLen = new int[st.len.length];
+        for (int i = 0; i < st.len.length; i++) seqSymLen[i] = st.len[i] & 0xFF;
+        this.seqSymVal = st.decodeLong;
       } else {
         this.fsstTermsDict = null;
         this.termsEnum = new TermsDict(entry.termsDictEntry, data);
@@ -1142,127 +1148,50 @@ final class Lucene90DocValuesProducer extends DocValuesProducer {
 
     @Override
     public BytesRef lookupOrd(int ord) throws IOException {
-      if (fsstTermsDict != null) {
-        return lookupOrdFSST(ord);
-      }
-      termsEnum.seekExact(ord);
-      return termsEnum.term();
-    }
-
-    private BytesRef lookupOrdFSST(int ord) throws IOException {
-      if (ord == lastBlockOrd + 1) {
-        if (blockIdx < blockCount) {
-          lastBlockOrd = ord;
-          int start = blockTermOffsets[blockIdx];
-          int len = blockTermOffsets[blockIdx + 1] - start;
-          blockIdx++;
-          blockResult.bytes = blockDecompBuf;
-          blockResult.offset = start;
-          blockResult.length = len;
-          return blockResult;
+      if (seqOffsets != null) {
+        final int start = seqOffsets[ord];
+        final int end = seqOffsets[ord + 1];
+        int bufOff = start - bufStart;
+        if (bufOff < 0 || bufOff + (end - start) > bufLen) {
+          bufStart = start;
+          bufOff = 0;
+          int toRead = Math.min(SEQ_BUF_SIZE, seqDataEnd - start);
+          seqInput.seek(start);
+          seqInput.readBytes(seqBuf, 0, toRead);
+          bufLen = toRead;
         }
-        // Block exhausted — decode next
-        decodeBlock(ord);
-        if (blockCount > 0) {
-          lastBlockOrd = ord;
-          int start = blockTermOffsets[0];
-          int len = blockTermOffsets[1] - start;
-          blockIdx = 1;
-          blockResult.bytes = blockDecompBuf;
-          blockResult.offset = start;
-          blockResult.length = len;
-          return blockResult;
-        }
-      }
-      // Random access
-      termsEnum.seekExact(ord);
-      lastBlockOrd = ord;
-      blockCount = 0;
-      blockIdx = 0;
-      blockSeqFilePos = fsstTermsDict.bytes.getFilePointer();
-      return termsEnum.term();
-    }
-
-    // --- Streaming block decoder state (lazily allocated for FSST only) ---
-    private static final int BLOCK_BUF_SIZE = 4096;
-    private byte[] blockCompBuf;
-    private byte[] blockDecompBuf;
-    private int[] blockTermOffsets;
-    private byte[] blockSymLen;   // cached from symbol table
-    private long[] blockSymVal;   // cached from symbol table
-    private final BytesRef blockResult = new BytesRef();
-    private int blockCount = 0;
-    private int blockIdx = 0;
-    private int lastBlockOrd = -2;
-    private long blockSeqFilePos = 0;
-
-    private void ensureBlockBuffers() {
-      if (blockCompBuf == null) {
-        blockCompBuf = new byte[BLOCK_BUF_SIZE];
-        blockDecompBuf = new byte[BLOCK_BUF_SIZE * 8 + 8];
-        blockTermOffsets = new int[512 + 1];
-        org.apache.lucene.codecs.lucene90.fsst.FSSTSymbolTable st = fsstTermsDict.decompressor.symbolTable();
-        blockSymLen = st.len;
-        blockSymVal = st.decodeLong;
-        blockTermOffsets = new int[512 + 1];
-      }
-    }
-
-    /** Decode a block of terms starting at the given ordinal. */
-    private void decodeBlock(int startOrd) throws IOException {
-      ensureBlockBuffers();
-      int toRead = readCompressedChunk();
-      if (toRead == 0) { blockCount = 0; return; }
-      parseTermsFromChunk(toRead);
-    }
-
-    /** Read next chunk of compressed data from mmap into blockCompBuf. */
-    private int readCompressedChunk() throws IOException {
-      fsstTermsDict.seqBytes.seek(blockSeqFilePos);
-      long remaining = fsstTermsDict.seqBytes.length() - blockSeqFilePos;
-      int toRead = (int) Math.min(BLOCK_BUF_SIZE, remaining);
-      if (toRead > 0) {
-        fsstTermsDict.seqBytes.readBytes(blockCompBuf, 0, toRead);
-      }
-      return toRead;
-    }
-
-    /** Parse varint lengths and decode FSST codes from blockCompBuf into blockDecompBuf. */
-    private void parseTermsFromChunk(int toRead) {
-      final byte[] symLen = blockSymLen;
-      final long[] symVal = blockSymVal;
-      final byte[] in = blockCompBuf;
-      final byte[] out = blockDecompBuf;
-      int inPos = 0;
-      int outPos = 0;
-      int termIdx = 0;
-
-      while (inPos < toRead && termIdx < 512) {
-        int compLen = in[inPos] & 0xFF;
-        if (compLen >= 0x80) break;
-        inPos++;
-        if (inPos + compLen > toRead) { inPos--; break; }
-
-        blockTermOffsets[termIdx++] = outPos;
-
-        int end = inPos + compLen;
-        while (inPos < end) {
-          int code = in[inPos++] & 0xFF;
+        final byte[] in = seqBuf;
+        final byte[] out = seqTerm.bytes;
+        final int[] sl = seqSymLen;
+        final long[] sv = seqSymVal;
+        int pos = bufOff, outPos = 0;
+        final int posEnd = bufOff + (end - start);
+        while (pos < posEnd) {
+          int code = in[pos++] & 0xFF;
           if (code != 0xFF) {
-            BitUtil.VH_LE_LONG.set(out, outPos, symVal[code]);
-            outPos += symLen[code] & 0xFF;
+            BitUtil.VH_LE_LONG.set(out, outPos, sv[code]);
+            outPos += sl[code];
           } else {
-            out[outPos++] = in[inPos++];
+            out[outPos++] = in[pos++];
           }
         }
+        seqTerm.length = outPos;
+        return seqTerm;
       }
-      blockTermOffsets[termIdx] = outPos;
-      blockCount = termIdx;
-      blockIdx = 0;
-      blockSeqFilePos += inPos;
+      termsEnum.seekExact(ord);
+      return termsEnum.term();
     }
 
-    @Override
+    private static final int SEQ_BUF_SIZE = 4096;
+    private final byte[] seqBuf = new byte[SEQ_BUF_SIZE];
+    private IndexInput seqInput;
+    private int[] seqOffsets;
+    private int seqDataEnd;
+    private BytesRef seqTerm;
+    private int[] seqSymLen;
+    private long[] seqSymVal;
+    private int bufStart = -1;
+    private int bufLen = 0;
     public int lookupTerm(BytesRef key) throws IOException {
       SeekStatus status = termsEnum.seekCeil(key);
       switch (status) {
@@ -1996,23 +1925,18 @@ final class Lucene90DocValuesProducer extends DocValuesProducer {
     CodecUtil.checksumEntireFile(data);
   }
 
-  /** Reads FSST-compressed terms with O(1) random access via per-term offsets. */
   private class FSSTTermsDict extends BaseTermsEnum
       implements org.apache.lucene.codecs.lucene90.fsst.FSSTCompressedAccess {
     final long termsDictSize;
-    final LongValues termOffsets; // for random access via DirectMonotonicReader
-    final IndexInput bytes; // mmap slice for random access
-    final IndexInput seqBytes; // separate mmap slice for sequential scan
+    final int[] termOffsets;
+    final IndexInput bytes;
     final org.apache.lucene.codecs.lucene90.fsst.FSSTDecompressor decompressor;
     final BytesRef term;
-    final byte[] compressedBuf;
     final BytesRef compressedTerm;
     long ord = -1;
 
     FSSTTermsDict(TermsDictEntry entry, IndexInput data) throws IOException {
       this.termsDictSize = entry.termsDictSize;
-
-      // Read symbol table from data
       IndexInput dataSlice =
           data.slice("fsst-terms", entry.termsDataOffset - entry.symbolTableLength,
               entry.termsDataLength + entry.symbolTableLength);
@@ -2021,128 +1945,77 @@ final class Lucene90DocValuesProducer extends DocValuesProducer {
       org.apache.lucene.codecs.lucene90.fsst.FSSTSymbolTable symbolTable =
           org.apache.lucene.codecs.lucene90.fsst.FSSTSymbolTable.load(tableBytes);
       this.decompressor = new org.apache.lucene.codecs.lucene90.fsst.FSSTDecompressor(symbolTable);
-
-      // mmap slices for random and sequential access
       bytes = data.slice("fsst-terms-data", entry.termsDataOffset, entry.termsDataLength);
-      seqBytes = bytes.clone();
-
-      // DirectMonotonicReader for random access offsets
-      RandomAccessInput addrSlice =
-          data.randomAccessSlice(entry.termsAddressesOffset, entry.termsAddressesLength);
-      termOffsets =
-          DirectMonotonicReader.getInstance(entry.termsAddressesMeta, addrSlice, false);
-
+      IndexInput offsetsSlice = data.slice("fsst-offsets",
+          entry.termsAddressesOffset, entry.termsAddressesLength);
+      termOffsets = new int[(int) termsDictSize + 1];
+      for (int i = 0; i <= termsDictSize; i++) termOffsets[i] = offsetsSlice.readInt();
       term = new BytesRef(entry.maxTermLength + 7);
-      compressedBuf = new byte[entry.maxTermLength * 2];
       compressedTerm = new BytesRef(entry.maxTermLength * 2);
     }
 
-    @Override
-    public boolean hasCompressedAccess() {
-      return true;
-    }
+    @Override public boolean hasCompressedAccess() { return true; }
 
     @Override
     public BytesRef lookupCompressedOrd(long ord) throws IOException {
-      long start = termOffsets.get(ord);
+      int start = termOffsets[(int) ord];
+      int len = termOffsets[(int) ord + 1] - start;
+      if (compressedTerm.bytes.length < len) compressedTerm.bytes = new byte[len];
       bytes.seek(start);
-      int compLen = bytes.readVInt();
-      if (compressedTerm.bytes.length < compLen) compressedTerm.bytes = new byte[compLen];
-      bytes.readBytes(compressedTerm.bytes, 0, compLen);
+      bytes.readBytes(compressedTerm.bytes, 0, len);
       compressedTerm.offset = 0;
-      compressedTerm.length = compLen;
+      compressedTerm.length = len;
       return compressedTerm;
     }
 
     @Override
     public int decompress(BytesRef compressed, byte[] output) throws IOException {
-      return decompressor.decompress(
-          compressed.bytes, compressed.offset, compressed.length, output);
+      return decompressor.decompress(compressed.bytes, compressed.offset, compressed.length, output);
     }
 
-    /** Simple per-term decompression via mmap. Used by termsEnum().next() and seekExact(). */
-    private void decompressTermRandom(long ord) throws IOException {
-      long start = termOffsets.get(ord);
+    void decompressTerm(long ord) throws IOException {
+      int start = termOffsets[(int) ord];
+      int len = termOffsets[(int) ord + 1] - start;
       bytes.seek(start);
-      int compLen = bytes.readVInt();
-      bytes.readBytes(compressedBuf, 0, compLen);
-      term.length = decompressor.decompress(compressedBuf, 0, compLen, term.bytes);
+      bytes.readBytes(compressedTerm.bytes, 0, len);
+      term.length = decompressor.decompress(compressedTerm.bytes, 0, len, term.bytes);
     }
 
-    @Override
-    public BytesRef next() throws IOException {
-      ++ord;
-      if (ord >= termsDictSize) return null;
-      decompressTermRandom(ord);
+    @Override public BytesRef next() throws IOException {
+      if (++ord >= termsDictSize) return null;
+      decompressTerm(ord);
       return term;
     }
 
-    @Override
-    public void seekExact(long ord) throws IOException {
+    @Override public void seekExact(long ord) throws IOException {
       this.ord = ord;
-      decompressTermRandom(ord);
+      decompressTerm(ord);
     }
 
     @Override
     public SeekStatus seekCeil(BytesRef text) throws IOException {
-      // Binary search using the reverse index would be better,
-      // but linear scan is acceptable for prototype
       long lo = 0, hi = termsDictSize - 1;
       while (lo <= hi) {
         long mid = (lo + hi) >>> 1;
-        decompressTermRandom(mid);
+        decompressTerm(mid);
         int cmp = term.compareTo(text);
-        if (cmp < 0) {
-          lo = mid + 1;
-        } else if (cmp > 0) {
-          hi = mid - 1;
-        } else {
-          ord = mid;
-
-          return SeekStatus.FOUND;
-        }
+        if (cmp < 0) lo = mid + 1;
+        else if (cmp > 0) hi = mid - 1;
+        else { ord = mid; return SeekStatus.FOUND; }
       }
-      if (lo >= termsDictSize) {
-        ord = termsDictSize;
-        return SeekStatus.END;
-      }
+      if (lo >= termsDictSize) { ord = termsDictSize; return SeekStatus.END; }
       ord = lo;
-
-      decompressTermRandom(ord);
+      decompressTerm(ord);
       return SeekStatus.NOT_FOUND;
     }
 
-    @Override
-    public BytesRef term() {
-      return term;
-    }
-
-    @Override
-    public long ord() {
-      return ord;
-    }
-
-    @Override
-    public long totalTermFreq() {
-      return -1L;
-    }
-
-    @Override
-    public PostingsEnum postings(PostingsEnum reuse, int flags) {
-      throw new UnsupportedOperationException();
-    }
-
-    @Override
-    public ImpactsEnum impacts(int flags) {
-      throw new UnsupportedOperationException();
-    }
-
-    @Override
-    public int docFreq() {
-      throw new UnsupportedOperationException();
-    }
+    @Override public BytesRef term() { return term; }
+    @Override public long ord() { return ord; }
+    @Override public long totalTermFreq() { return -1L; }
+    @Override public PostingsEnum postings(PostingsEnum reuse, int flags) { throw new UnsupportedOperationException(); }
+    @Override public ImpactsEnum impacts(int flags) { throw new UnsupportedOperationException(); }
+    @Override public int docFreq() { throw new UnsupportedOperationException(); }
   }
-
   /**
    * Reader for longs split into blocks of different bits per values. The longs are requested by
    * index and must be accessed in monotonically increasing order.
