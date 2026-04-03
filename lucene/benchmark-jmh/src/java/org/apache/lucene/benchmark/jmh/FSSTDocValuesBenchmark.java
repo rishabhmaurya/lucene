@@ -220,14 +220,30 @@ public class FSSTDocValuesBenchmark {
       String line;
       while ((line = br.readLine()) != null && terms.size() < maxTerms) {
         if (line.startsWith("FIELDS_HEADER")) continue;
-        String[] fields = line.split("\t", -1);
-        String term;
-        if (isGeonames && fields.length >= 18) {
-          term = fields[1] + ", " + fields[8] + ", " + fields[17]; // name, country, timezone
+        if (isGeonames) {
+          // Parse only needed fields by finding tab positions
+          int t1 = line.indexOf('\t');
+          if (t1 < 0) continue;
+          int t2 = line.indexOf('\t', t1 + 1);
+          if (t2 < 0) continue;
+          String name = line.substring(t1 + 1, t2);
+          // Find field 9 (country code) — skip to 8th tab
+          int pos = t2;
+          for (int f = 2; f < 8 && pos >= 0; f++) pos = line.indexOf('\t', pos + 1);
+          if (pos < 0) continue;
+          int t9 = line.indexOf('\t', pos + 1);
+          if (t9 < 0) continue;
+          String country = line.substring(pos + 1, t9);
+          // Find field 18 (timezone) — skip to 17th tab
+          for (int f = 9; f < 17 && t9 >= 0; f++) t9 = line.indexOf('\t', t9 + 1);
+          if (t9 < 0) continue;
+          int t18 = line.indexOf('\t', t9 + 1);
+          String tz = (t18 >= 0) ? line.substring(t9 + 1, t18) : line.substring(t9 + 1);
+          terms.add(name + ", " + country + ", " + tz);
         } else {
-          term = fields.length > 0 ? fields[0] : "";
+          int tab = line.indexOf('\t');
+          if (tab > 0) terms.add(line.substring(0, tab));
         }
-        if (!term.isEmpty()) terms.add(term);
       }
     }
     return terms;
