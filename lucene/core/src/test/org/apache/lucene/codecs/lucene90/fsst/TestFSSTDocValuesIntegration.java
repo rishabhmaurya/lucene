@@ -253,6 +253,43 @@ public class TestFSSTDocValuesIntegration extends LuceneTestCase {
     }
   }
 
+  /** Verify FSST works with compound file format (default Lucene behavior). */
+  public void testCompoundFile() throws IOException {
+    try (Directory dir = newDirectory()) {
+      Lucene104Codec codec = fsstCodec();
+      // Explicitly enable compound file (the default)
+      IndexWriterConfig conf = new IndexWriterConfig().setCodec(codec).setUseCompoundFile(true);
+      try (IndexWriter writer = new IndexWriter(dir, conf)) {
+        for (String url : URLS) {
+          Document doc = new Document();
+          doc.add(new SortedDocValuesField("url", new BytesRef(url)));
+          writer.addDocument(doc);
+        }
+        writer.forceMerge(1);
+      }
+      try (DirectoryReader reader = DirectoryReader.open(dir)) {
+        assertEquals(1, reader.leaves().size());
+        SortedDocValues dv = reader.leaves().get(0).reader().getSortedDocValues("url");
+        assertEquals(URLS.length, dv.getValueCount());
+        for (int ord = 0; ord < dv.getValueCount(); ord++) {
+          String term = dv.lookupOrd(ord).utf8ToString();
+          assertTrue("Term should be a URL: " + term, term.startsWith("http://"));
+        }
+        // Verify compressed access works through compound file
+        if (dv instanceof FSSTCompressedAccess fsst && fsst.hasCompressedAccess()) {
+          byte[] buf = new byte[4096];
+          for (int ord = 0; ord < dv.getValueCount(); ord++) {
+            BytesRef compressed = fsst.lookupCompressedOrd(ord);
+            int len = fsst.decompress(compressed, buf);
+            assertEquals(
+                dv.lookupOrd(ord).utf8ToString(),
+                new String(buf, 0, len, StandardCharsets.UTF_8));
+          }
+        }
+      }
+    }
+  }
+
   /** Multi-segment merge with many unique terms — verifies no data corruption during merge. */
   public void testLargeMerge() throws IOException {
     try (Directory dir = newDirectory()) {
