@@ -19,7 +19,10 @@ package org.apache.lucene.codecs.lucene90.fsst;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.Iterator;
 import java.util.List;
+import java.util.Set;
+import java.util.TreeSet;
 import org.apache.lucene.codecs.DocValuesFormat;
 import org.apache.lucene.codecs.lucene90.Lucene90DocValuesFormat;
 import org.apache.lucene.codecs.lucene104.Lucene104Codec;
@@ -245,6 +248,56 @@ public class TestFSSTDocValuesIntegration extends LuceneTestCase {
                 dv.lookupOrd(ord).utf8ToString(),
                 new String(buf, 0, len, StandardCharsets.UTF_8));
           }
+        }
+      }
+    }
+  }
+
+  /** Multi-segment merge with many unique terms — verifies no data corruption during merge. */
+  public void testLargeMerge() throws IOException {
+    try (Directory dir = newDirectory()) {
+      Lucene104Codec codec = fsstCodec();
+      // Use NoMergePolicy to create multiple segments, then merge explicitly
+      IndexWriterConfig conf =
+          new IndexWriterConfig().setCodec(codec).setMergePolicy(NoMergePolicy.INSTANCE);
+      int docsPerSegment = 5000;
+      int numSegments = 3;
+      Set<String> allTerms = new TreeSet<>();
+      try (IndexWriter writer = new IndexWriter(dir, conf)) {
+        for (int seg = 0; seg < numSegments; seg++) {
+          for (int i = 0; i < docsPerSegment; i++) {
+            int id = seg * docsPerSegment + i;
+            String term = "http://example" + (id % 200) + ".com/path/" + id + "/item?q=" + (id * 3);
+            allTerms.add(term);
+            Document doc = new Document();
+            doc.add(new SortedDocValuesField("url", new BytesRef(term)));
+            writer.addDocument(doc);
+          }
+          writer.flush();
+        }
+      }
+
+      // Verify multiple segments exist
+      try (DirectoryReader reader = DirectoryReader.open(dir)) {
+        assertTrue("Should have multiple segments", reader.leaves().size() >= numSegments);
+      }
+
+      // Merge into one segment
+      conf = new IndexWriterConfig().setCodec(codec);
+      try (IndexWriter writer = new IndexWriter(dir, conf)) {
+        writer.forceMerge(1);
+      }
+
+      // Verify merged result
+      try (DirectoryReader reader = DirectoryReader.open(dir)) {
+        assertEquals(1, reader.leaves().size());
+        SortedDocValues dv = reader.leaves().get(0).reader().getSortedDocValues("url");
+        assertEquals(allTerms.size(), dv.getValueCount());
+
+        // Verify all terms in sorted order
+        Iterator<String> expected = allTerms.iterator();
+        for (int ord = 0; ord < dv.getValueCount(); ord++) {
+          assertEquals("Mismatch at ord " + ord, expected.next(), dv.lookupOrd(ord).utf8ToString());
         }
       }
     }
