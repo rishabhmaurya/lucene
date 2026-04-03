@@ -1188,6 +1188,8 @@ final class Lucene90DocValuesProducer extends DocValuesProducer {
     private byte[] blockCompBuf;
     private byte[] blockDecompBuf;
     private int[] blockTermOffsets;
+    private byte[] blockSymLen;   // cached from symbol table
+    private long[] blockSymVal;   // cached from symbol table
     private final BytesRef blockResult = new BytesRef();
     private int blockCount = 0;
     private int blockIdx = 0;
@@ -1198,6 +1200,10 @@ final class Lucene90DocValuesProducer extends DocValuesProducer {
       if (blockCompBuf == null) {
         blockCompBuf = new byte[BLOCK_BUF_SIZE];
         blockDecompBuf = new byte[BLOCK_BUF_SIZE * 8 + 8];
+        blockTermOffsets = new int[512 + 1];
+        org.apache.lucene.codecs.lucene90.fsst.FSSTSymbolTable st = fsstTermsDict.decompressor.symbolTable();
+        blockSymLen = st.len;
+        blockSymVal = st.decodeLong;
         blockTermOffsets = new int[512 + 1];
       }
     }
@@ -1213,8 +1219,8 @@ final class Lucene90DocValuesProducer extends DocValuesProducer {
       fsstTermsDict.seqBytes.readBytes(blockCompBuf, 0, toRead);
 
       // Stream-decode: process compressed bytes continuously, track term boundaries
-      final byte[] symLen = fsstTermsDict.decompressor.symbolTable().len;
-      final long[] symVal = fsstTermsDict.decompressor.symbolTable().decodeLong;
+      final byte[] symLen = blockSymLen;
+      final long[] symVal = blockSymVal;
       final byte[] in = blockCompBuf;
       final byte[] out = blockDecompBuf;
       int inPos = 0;
