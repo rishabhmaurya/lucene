@@ -150,7 +150,7 @@ public class FSSTDocValuesBenchmark {
     valueCount = docValues.getValueCount();
 
     Random rng = new Random(42);
-    randomOrds = new int[Math.min(10000, valueCount)];
+    randomOrds = new int[valueCount];
     for (int i = 0; i < randomOrds.length; i++) {
       randomOrds[i] = rng.nextInt(valueCount);
     }
