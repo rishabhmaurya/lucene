@@ -1142,8 +1142,114 @@ final class Lucene90DocValuesProducer extends DocValuesProducer {
 
     @Override
     public BytesRef lookupOrd(int ord) throws IOException {
+      if (fsstTermsDict != null) {
+        return lookupOrdFSST(ord);
+      }
       termsEnum.seekExact(ord);
       return termsEnum.term();
+    }
+
+    private BytesRef lookupOrdFSST(int ord) throws IOException {
+      if (ord == lastBlockOrd + 1) {
+        if (blockIdx < blockCount) {
+          lastBlockOrd = ord;
+          int start = blockTermOffsets[blockIdx];
+          int len = blockTermOffsets[blockIdx + 1] - start;
+          blockIdx++;
+          blockResult.bytes = blockDecompBuf;
+          blockResult.offset = start;
+          blockResult.length = len;
+          return blockResult;
+        }
+        // Block exhausted — decode next
+        decodeBlock(ord);
+        if (blockCount > 0) {
+          lastBlockOrd = ord;
+          int start = blockTermOffsets[0];
+          int len = blockTermOffsets[1] - start;
+          blockIdx = 1;
+          blockResult.bytes = blockDecompBuf;
+          blockResult.offset = start;
+          blockResult.length = len;
+          return blockResult;
+        }
+      }
+      // Random access
+      termsEnum.seekExact(ord);
+      lastBlockOrd = ord;
+      blockCount = 0;
+      blockIdx = 0;
+      blockSeqFilePos = fsstTermsDict.bytes.getFilePointer();
+      return termsEnum.term();
+    }
+
+    // --- Streaming block decoder state (lazily allocated for FSST only) ---
+    private static final int BLOCK_BUF_SIZE = 4096;
+    private byte[] blockCompBuf;
+    private byte[] blockDecompBuf;
+    private int[] blockTermOffsets;
+    private final BytesRef blockResult = new BytesRef();
+    private int blockCount = 0;
+    private int blockIdx = 0;
+    private int lastBlockOrd = -2;
+    private long blockSeqFilePos = 0;
+
+    private void ensureBlockBuffers() {
+      if (blockCompBuf == null) {
+        blockCompBuf = new byte[BLOCK_BUF_SIZE];
+        blockDecompBuf = new byte[BLOCK_BUF_SIZE * 8 + 8];
+        blockTermOffsets = new int[512 + 1];
+      }
+    }
+
+    /** Decode a block of terms starting at the given ordinal. */
+    private void decodeBlock(int startOrd) throws IOException {
+      ensureBlockBuffers();
+      // Position and read compressed chunk
+      fsstTermsDict.seqBytes.seek(blockSeqFilePos);
+      long remaining = fsstTermsDict.seqBytes.length() - blockSeqFilePos;
+      int toRead = (int) Math.min(BLOCK_BUF_SIZE, remaining);
+      if (toRead == 0) { blockCount = 0; return; }
+      fsstTermsDict.seqBytes.readBytes(blockCompBuf, 0, toRead);
+
+      // Stream-decode: process compressed bytes continuously, track term boundaries
+      final byte[] symLen = fsstTermsDict.decompressor.symbolTable().len;
+      final long[] symVal = fsstTermsDict.decompressor.symbolTable().decodeLong;
+      final byte[] in = blockCompBuf;
+      final byte[] out = blockDecompBuf;
+      int inPos = 0;
+      int outPos = 0;
+      int termIdx = 0;
+
+      while (inPos < toRead && termIdx < 512) {
+        // Read varint length (1-byte fast path)
+        int compLen = in[inPos] & 0xFF;
+        if (compLen >= 0x80) break; // multi-byte varint — stop
+        inPos++;
+
+        if (inPos + compLen > toRead) {
+          inPos--; // back up
+          break;
+        }
+
+        blockTermOffsets[termIdx++] = outPos;
+
+        // Decode this term's codes — no per-term loop break
+        int end = inPos + compLen;
+        while (inPos < end) {
+          int code = in[inPos++] & 0xFF;
+          if (code != 0xFF) {
+            BitUtil.VH_LE_LONG.set(out, outPos, symVal[code]);
+            outPos += symLen[code] & 0xFF;
+          } else {
+            out[outPos++] = in[inPos++];
+          }
+        }
+      }
+      blockTermOffsets[termIdx] = outPos;
+      blockCount = termIdx;
+      blockIdx = 0;
+      blockSeqFilePos += inPos;
     }
 
     @Override
