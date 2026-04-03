@@ -1211,14 +1211,24 @@ final class Lucene90DocValuesProducer extends DocValuesProducer {
     /** Decode a block of terms starting at the given ordinal. */
     private void decodeBlock(int startOrd) throws IOException {
       ensureBlockBuffers();
-      // Position and read compressed chunk
+      int toRead = readCompressedChunk();
+      if (toRead == 0) { blockCount = 0; return; }
+      parseTermsFromChunk(toRead);
+    }
+
+    /** Read next chunk of compressed data from mmap into blockCompBuf. */
+    private int readCompressedChunk() throws IOException {
       fsstTermsDict.seqBytes.seek(blockSeqFilePos);
       long remaining = fsstTermsDict.seqBytes.length() - blockSeqFilePos;
       int toRead = (int) Math.min(BLOCK_BUF_SIZE, remaining);
-      if (toRead == 0) { blockCount = 0; return; }
-      fsstTermsDict.seqBytes.readBytes(blockCompBuf, 0, toRead);
+      if (toRead > 0) {
+        fsstTermsDict.seqBytes.readBytes(blockCompBuf, 0, toRead);
+      }
+      return toRead;
+    }
 
-      // Stream-decode: process compressed bytes continuously, track term boundaries
+    /** Parse varint lengths and decode FSST codes from blockCompBuf into blockDecompBuf. */
+    private void parseTermsFromChunk(int toRead) {
       final byte[] symLen = blockSymLen;
       final long[] symVal = blockSymVal;
       final byte[] in = blockCompBuf;
@@ -1228,34 +1238,34 @@ final class Lucene90DocValuesProducer extends DocValuesProducer {
       int termIdx = 0;
 
       while (inPos < toRead && termIdx < 512) {
-        // Read varint length (1-byte fast path)
         int compLen = in[inPos] & 0xFF;
-        if (compLen >= 0x80) break; // multi-byte varint — stop
+        if (compLen >= 0x80) break;
         inPos++;
-
-        if (inPos + compLen > toRead) {
-          inPos--; // back up
-          break;
-        }
+        if (inPos + compLen > toRead) { inPos--; break; }
 
         blockTermOffsets[termIdx++] = outPos;
-
-        // Decode this term's codes — no per-term loop break
-        int end = inPos + compLen;
-        while (inPos < end) {
-          int code = in[inPos++] & 0xFF;
-          if (code != 0xFF) {
-            BitUtil.VH_LE_LONG.set(out, outPos, symVal[code]);
-            outPos += symLen[code] & 0xFF;
-          } else {
-            out[outPos++] = in[inPos++];
-          }
-        }
+        outPos = decodeCodes(in, inPos, inPos + compLen, symLen, symVal, out, outPos);
+        inPos += compLen;
       }
       blockTermOffsets[termIdx] = outPos;
       blockCount = termIdx;
       blockIdx = 0;
       blockSeqFilePos += inPos;
+    }
+
+    /** Decode FSST codes from in[pos..end) into out[outPos..]. Returns new outPos. */
+    private static int decodeCodes(
+        byte[] in, int pos, int end, byte[] symLen, long[] symVal, byte[] out, int outPos) {
+      while (pos < end) {
+        int code = in[pos++] & 0xFF;
+        if (code != 0xFF) {
+          BitUtil.VH_LE_LONG.set(out, outPos, symVal[code]);
+          outPos += symLen[code] & 0xFF;
+        } else {
+          out[outPos++] = in[pos++];
+        }
+      }
+      return outPos;
     }
 
     @Override
