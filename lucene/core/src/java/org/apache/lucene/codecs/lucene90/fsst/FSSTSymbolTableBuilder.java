@@ -165,38 +165,41 @@ public final class FSSTSymbolTableBuilder {
         }
       }
 
-      // Generate candidates: existing symbols + concatenations of adjacent pairs
-      List<Symbol> candidates = new ArrayList<>(currentSymbols);
+      // Score candidates: existing symbols use codeFreq from compression,
+      // new concatenations need frequency counting
+      Map<Symbol, Long> candidateGain = new HashMap<>();
 
-      // Add concatenations of frequent adjacent symbols
+      // Existing symbols: gain = codeFreq * length (already computed during compression)
+      for (int code = 0; code < 255; code++) {
+        if (codeFreq[code] > 0 && code < currentSymbols.size()) {
+          Symbol s = currentSymbols.get(code);
+          candidateGain.put(s, (long) codeFreq[code] * s.bytes.length);
+        }
+      }
+
+      // New concatenation candidates: compress sample and count how often each concat appears
+      // Use a hash map for O(1) lookup instead of O(n) scanning
+      Map<Symbol, Long> concatFreq = new HashMap<>();
       for (int i = 0; i < compLen - 1; i++) {
         int code1 = compressed[i] & 0xFF;
-        if (code1 == FSSTSymbolTable.ESCAPE) {
-          i++;
-          continue;
-        }
+        if (code1 == FSSTSymbolTable.ESCAPE) { i++; continue; }
         int j = i + 1;
+        if (j >= compLen) break;
         int code2 = compressed[j] & 0xFF;
-        if (code2 == FSSTSymbolTable.ESCAPE) {
-          continue;
-        }
-        // Concatenate symbols for code1 and code2
+        if (code2 == FSSTSymbolTable.ESCAPE) continue;
         int len1 = tempTable.symbolLength(code1);
         int len2 = tempTable.symbolLength(code2);
         if (len1 + len2 <= MAX_SYMBOL_LEN) {
           byte[] concat = new byte[len1 + len2];
           tempTable.symbolBytes(code1, concat, 0);
           tempTable.symbolBytes(code2, concat, len1);
-          candidates.add(new Symbol(concat));
+          Symbol s = new Symbol(concat);
+          concatFreq.merge(s, 1L, Long::sum);
         }
       }
-
-      // Score candidates by gain = length × frequency in sample
-      Map<Symbol, Long> candidateGain = new HashMap<>();
-      for (Symbol s : candidates) {
-        long freq = countOccurrences(sample, s.bytes);
-        long gain = freq * s.bytes.length;
-        candidateGain.merge(s, gain, Long::max);
+      for (var e : concatFreq.entrySet()) {
+        long gain = e.getValue() * e.getKey().bytes.length;
+        candidateGain.merge(e.getKey(), gain, Long::max);
       }
 
       // Select top 255 by gain
@@ -211,21 +214,6 @@ public final class FSSTSymbolTableBuilder {
     }
 
     return buildTable(currentSymbols);
-  }
-
-  private static long countOccurrences(byte[] data, byte[] pattern) {
-    long count = 0;
-    for (int i = 0; i <= data.length - pattern.length; i++) {
-      boolean match = true;
-      for (int j = 0; j < pattern.length; j++) {
-        if (data[i + j] != pattern[j]) {
-          match = false;
-          break;
-        }
-      }
-      if (match) count++;
-    }
-    return count;
   }
 
   private static FSSTSymbolTable buildTable(List<Symbol> symbols) {
