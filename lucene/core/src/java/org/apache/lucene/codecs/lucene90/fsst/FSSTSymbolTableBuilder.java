@@ -176,20 +176,21 @@ public final class FSSTSymbolTableBuilder {
       // new concatenations need frequency counting
       Map<Symbol, Long> candidateGain = new HashMap<>();
 
-      // Existing symbols: gain = codeFreq * length
+      // Existing symbols: gain = codeFreq * length, with 8x boost for single-byte (like C reference)
       for (int code = 0; code < 255; code++) {
         if (codeFreq[code] > 0 && code < currentSymbols.size()) {
           Symbol s = currentSymbols.get(code);
-          candidateGain.put(s, (long) codeFreq[code] * s.bytes.length);
+          long boost = (s.bytes.length == 1) ? 8L : 1L;
+          candidateGain.put(s, boost * codeFreq[code] * s.bytes.length);
         }
       }
 
-      // Single-byte alternatives: ensure common bytes always have a chance
+      // Single-byte alternatives from multi-byte matches + escaped bytes, also with 8x boost
       for (int b = 0; b < 256; b++) {
         long freq = singleByteFreq[b] + escapedFreq[b];
         if (freq > 0) {
           Symbol s = new Symbol(new byte[]{(byte) b});
-          candidateGain.merge(s, freq, Long::max);
+          candidateGain.merge(s, 8L * freq, Long::max);
         }
       }
 
