@@ -1244,28 +1244,22 @@ final class Lucene90DocValuesProducer extends DocValuesProducer {
         if (inPos + compLen > toRead) { inPos--; break; }
 
         blockTermOffsets[termIdx++] = outPos;
-        outPos = decodeCodes(in, inPos, inPos + compLen, symLen, symVal, out, outPos);
-        inPos += compLen;
+
+        int end = inPos + compLen;
+        while (inPos < end) {
+          int code = in[inPos++] & 0xFF;
+          if (code != 0xFF) {
+            BitUtil.VH_LE_LONG.set(out, outPos, symVal[code]);
+            outPos += symLen[code] & 0xFF;
+          } else {
+            out[outPos++] = in[inPos++];
+          }
+        }
       }
       blockTermOffsets[termIdx] = outPos;
       blockCount = termIdx;
       blockIdx = 0;
       blockSeqFilePos += inPos;
-    }
-
-    /** Decode FSST codes from in[pos..end) into out[outPos..]. Returns new outPos. */
-    private static int decodeCodes(
-        byte[] in, int pos, int end, byte[] symLen, long[] symVal, byte[] out, int outPos) {
-      while (pos < end) {
-        int code = in[pos++] & 0xFF;
-        if (code != 0xFF) {
-          BitUtil.VH_LE_LONG.set(out, outPos, symVal[code]);
-          outPos += symLen[code] & 0xFF;
-        } else {
-          out[outPos++] = in[pos++];
-        }
-      }
-      return outPos;
     }
 
     @Override
