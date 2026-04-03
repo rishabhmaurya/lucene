@@ -192,16 +192,22 @@ public class FSSTDocValuesBenchmark {
     }
   }
 
-  /** Compressed ordinal access — FSST returns compressed bytes; LZ4 falls back to lookupOrd. */
+  /** FSST-only: random compressed ordinal access (no decompression). Skipped for LZ4. */
   @Benchmark
-  public void lookupCompressedOrd(Blackhole bh) throws Exception {
+  public void randomLookupCompressedOrd(Blackhole bh) throws Exception {
     if (docValues instanceof FSSTCompressedAccess fsst && fsst.hasCompressedAccess()) {
       for (int ord : randomOrds) {
         bh.consume(fsst.lookupCompressedOrd(ord));
       }
-    } else {
-      for (int ord : randomOrds) {
-        bh.consume(docValues.lookupOrd(ord));
+    }
+  }
+
+  /** FSST-only: sequential compressed ordinal access (no decompression). Skipped for LZ4. */
+  @Benchmark
+  public void sequentialLookupCompressedOrd(Blackhole bh) throws Exception {
+    if (docValues instanceof FSSTCompressedAccess fsst && fsst.hasCompressedAccess()) {
+      for (int ord = 0; ord < valueCount; ord++) {
+        bh.consume(fsst.lookupCompressedOrd(ord));
       }
     }
   }
