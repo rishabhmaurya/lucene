@@ -154,13 +154,15 @@ public final class FSSTSymbolTableBuilder {
       byte[] compressed = new byte[sample.length * 2];
       int compLen = tempComp.compress(sample, 0, sample.length, compressed);
 
-      // Count codes, single-byte alternatives, and adjacent pairs
+      // Count codes, single-byte alternatives, and escaped bytes
       int[] codeFreq = new int[256];
       int[] singleByteFreq = new int[256]; // frequency of first byte as alternative
+      int[] escapedFreq = new int[256]; // frequency of escaped literal bytes
       for (int i = 0; i < compLen; i++) {
         int code = compressed[i] & 0xFF;
         if (code == FSSTSymbolTable.ESCAPE) {
           i++; // skip literal byte
+          if (i < compLen) escapedFreq[compressed[i] & 0xFF]++;
         } else {
           codeFreq[code]++;
           // Also count the single-byte alternative (like C reference does)
@@ -184,9 +186,10 @@ public final class FSSTSymbolTableBuilder {
 
       // Single-byte alternatives: ensure common bytes always have a chance
       for (int b = 0; b < 256; b++) {
-        if (singleByteFreq[b] > 0) {
+        long freq = singleByteFreq[b] + escapedFreq[b];
+        if (freq > 0) {
           Symbol s = new Symbol(new byte[]{(byte) b});
-          candidateGain.merge(s, (long) singleByteFreq[b], Long::max);
+          candidateGain.merge(s, freq, Long::max);
         }
       }
 
