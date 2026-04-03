@@ -154,14 +154,19 @@ public final class FSSTSymbolTableBuilder {
       byte[] compressed = new byte[sample.length * 2];
       int compLen = tempComp.compress(sample, 0, sample.length, compressed);
 
-      // Count codes and adjacent pairs
+      // Count codes, single-byte alternatives, and adjacent pairs
       int[] codeFreq = new int[256];
+      int[] singleByteFreq = new int[256]; // frequency of first byte as alternative
       for (int i = 0; i < compLen; i++) {
         int code = compressed[i] & 0xFF;
         if (code == FSSTSymbolTable.ESCAPE) {
           i++; // skip literal byte
         } else {
           codeFreq[code]++;
+          // Also count the single-byte alternative (like C reference does)
+          if (code < currentSymbols.size() && currentSymbols.get(code).bytes.length > 1) {
+            singleByteFreq[currentSymbols.get(code).bytes[0] & 0xFF]++;
+          }
         }
       }
 
@@ -169,11 +174,19 @@ public final class FSSTSymbolTableBuilder {
       // new concatenations need frequency counting
       Map<Symbol, Long> candidateGain = new HashMap<>();
 
-      // Existing symbols: gain = codeFreq * length (already computed during compression)
+      // Existing symbols: gain = codeFreq * length
       for (int code = 0; code < 255; code++) {
         if (codeFreq[code] > 0 && code < currentSymbols.size()) {
           Symbol s = currentSymbols.get(code);
           candidateGain.put(s, (long) codeFreq[code] * s.bytes.length);
+        }
+      }
+
+      // Single-byte alternatives: ensure common bytes always have a chance
+      for (int b = 0; b < 256; b++) {
+        if (singleByteFreq[b] > 0) {
+          Symbol s = new Symbol(new byte[]{(byte) b});
+          candidateGain.merge(s, (long) singleByteFreq[b], Long::max);
         }
       }
 
