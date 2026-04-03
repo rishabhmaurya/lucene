@@ -885,6 +885,7 @@ final class Lucene90DocValuesConsumer extends DocValuesConsumer {
       for (BytesRef term = iterator.next(); term != null; term = iterator.next()) {
         writer.add(data.getFilePointer() - start);
         int compLen = compressor.compress(term.bytes, term.offset, term.length, compressBuf);
+        data.writeVInt(compLen); // length prefix for sequential scan
         data.writeBytes(compressBuf, 0, compLen);
         maxTermLength = Math.max(maxTermLength, term.length);
       }
