@@ -101,7 +101,7 @@ public class FSSTDocValuesBenchmark {
   public void setup() throws Exception {
     List<String> terms =
         (dataFile != null && !dataFile.isEmpty())
-            ? loadWikiTitles(dataFile, numTerms)
+            ? loadTerms(dataFile, numTerms)
             : generateSyntheticTerms(numTerms);
 
     tempDir = Files.createTempDirectory("fsst-bench");
@@ -212,20 +212,25 @@ public class FSSTDocValuesBenchmark {
     }
   }
 
-  /** Load Wikipedia article titles from enwiki line docs file. */
-  private static List<String> loadWikiTitles(String path, int maxTerms) throws Exception {
-    List<String> titles = new ArrayList<>();
+  /** Load terms from a tab-delimited file. Detects enwiki (field 1) vs geonames (fields 2+9+18). */
+  private static List<String> loadTerms(String path, int maxTerms) throws Exception {
+    boolean isGeonames = path.contains("allCountries");
+    List<String> terms = new ArrayList<>();
     try (var br = new BufferedReader(new FileReader(path, StandardCharsets.UTF_8))) {
       String line;
-      while ((line = br.readLine()) != null && titles.size() < maxTerms) {
+      while ((line = br.readLine()) != null && terms.size() < maxTerms) {
         if (line.startsWith("FIELDS_HEADER")) continue;
-        int tab = line.indexOf('\t');
-        if (tab > 0) {
-          titles.add(line.substring(0, tab));
+        String[] fields = line.split("\t", -1);
+        String term;
+        if (isGeonames && fields.length >= 18) {
+          term = fields[1] + ", " + fields[8] + ", " + fields[17]; // name, country, timezone
+        } else {
+          term = fields.length > 0 ? fields[0] : "";
         }
+        if (!term.isEmpty()) terms.add(term);
       }
     }
-    return titles;
+    return terms;
   }
 
   /** Generate synthetic URL-like terms as fallback. */
