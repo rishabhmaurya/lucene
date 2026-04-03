@@ -888,13 +888,22 @@ final class Lucene90DocValuesConsumer extends DocValuesConsumer {
     meta.writeLong(start);
     meta.writeLong(data.getFilePointer() - start);
 
-    // Write flat int offsets to data
-    long offsetsStart = data.getFilePointer();
+    // Write offsets using DirectMonotonicWriter (compact on disk)
+    meta.writeInt(DIRECT_MONOTONIC_BLOCK_SHIFT);
+    ByteBuffersDataOutput addressBuffer = new ByteBuffersDataOutput();
+    ByteBuffersIndexOutput addressOutput =
+        new ByteBuffersIndexOutput(addressBuffer, "temp", "temp");
+    DirectMonotonicWriter addrWriter =
+        DirectMonotonicWriter.getInstance(
+            meta, addressOutput, size + 1, DIRECT_MONOTONIC_BLOCK_SHIFT);
     for (int i = 0; i <= size; i++) {
-      data.writeInt(offsets[i]);
+      addrWriter.add(offsets[i]);
     }
-    meta.writeLong(offsetsStart);
-    meta.writeLong(data.getFilePointer() - offsetsStart);
+    addrWriter.finish();
+    long addrStart = data.getFilePointer();
+    addressBuffer.copyTo(data);
+    meta.writeLong(addrStart);
+    meta.writeLong(data.getFilePointer() - addrStart);
 
     // Block shift for reverse index DirectMonotonic
     meta.writeInt(DIRECT_MONOTONIC_BLOCK_SHIFT);

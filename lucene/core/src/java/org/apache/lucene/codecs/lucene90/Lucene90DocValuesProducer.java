@@ -348,11 +348,15 @@ final class Lucene90DocValuesProducer extends DocValuesProducer {
     entry.maxTermLength = meta.readInt();
     entry.termsDataOffset = meta.readLong();
     entry.termsDataLength = meta.readLong();
+    // Term offsets (DirectMonotonic — loaded into heap int[] at open time)
+    final int addrBlockShift = meta.readInt();
+    entry.termsAddressesMeta =
+        DirectMonotonicReader.loadMeta(meta, entry.termsDictSize + 1, addrBlockShift);
     entry.termsAddressesOffset = meta.readLong();
     entry.termsAddressesLength = meta.readLong();
     // Reverse index
-    final int blockShift = meta.readInt();
     entry.termsDictIndexShift = meta.readInt();
+    final int blockShift = meta.readInt();
     final long indexSize =
         (entry.termsDictSize + (1L << entry.termsDictIndexShift) - 1) >>> entry.termsDictIndexShift;
     entry.termsIndexAddressesMeta = DirectMonotonicReader.loadMeta(meta, 1 + indexSize, blockShift);
@@ -1946,10 +1950,13 @@ final class Lucene90DocValuesProducer extends DocValuesProducer {
           org.apache.lucene.codecs.lucene90.fsst.FSSTSymbolTable.load(tableBytes);
       this.decompressor = new org.apache.lucene.codecs.lucene90.fsst.FSSTDecompressor(symbolTable);
       bytes = data.slice("fsst-terms-data", entry.termsDataOffset, entry.termsDataLength);
-      IndexInput offsetsSlice = data.slice("fsst-offsets",
-          entry.termsAddressesOffset, entry.termsAddressesLength);
+      // Load offsets from DirectMonotonic into heap int[]
+      RandomAccessInput addrSlice =
+          data.randomAccessSlice(entry.termsAddressesOffset, entry.termsAddressesLength);
+      LongValues dmOffsets =
+          DirectMonotonicReader.getInstance(entry.termsAddressesMeta, addrSlice, false);
       termOffsets = new int[(int) termsDictSize + 1];
-      for (int i = 0; i <= termsDictSize; i++) termOffsets[i] = offsetsSlice.readInt();
+      for (int i = 0; i <= termsDictSize; i++) termOffsets[i] = (int) dmOffsets.get(i);
       term = new BytesRef(entry.maxTermLength + 7);
       compressedTerm = new BytesRef(entry.maxTermLength * 2);
     }
