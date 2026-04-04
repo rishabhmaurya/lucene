@@ -184,6 +184,32 @@ public class FSSTDocValuesBenchmark {
     }
   }
 
+  /** Strided lookupOrd: every 4th ordinal (simulates filtered scan). */
+  @Benchmark
+  public void stridedLookupOrd(Blackhole bh) throws Exception {
+    for (int ord = 0; ord < valueCount; ord += 4) {
+      bh.consume(docValues.lookupOrd(ord));
+    }
+  }
+
+  /** Clustered lookupOrd: bursts of varying length with gaps (simulates aggregation). */
+  @Benchmark
+  public void clusteredLookupOrd(Blackhole bh) throws Exception {
+    final int[] burstLens = {3, 7, 12, 5, 20, 2, 9, 15, 4, 8};
+    final int gap = 50;
+    int ord = 0;
+    int burstIdx = 0;
+    while (ord < valueCount) {
+      int burstLen = burstLens[burstIdx % burstLens.length];
+      int burstEnd = Math.min(ord + burstLen, valueCount);
+      for (int i = ord; i < burstEnd; i++) {
+        bh.consume(docValues.lookupOrd(i));
+      }
+      ord = burstEnd + gap;
+      burstIdx++;
+    }
+  }
+
   /** Random lookupOrd: access ordinals in random order. */
   @Benchmark
   public void randomLookupOrd(Blackhole bh) throws Exception {

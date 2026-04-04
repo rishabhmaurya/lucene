@@ -50,6 +50,9 @@ import org.apache.lucene.store.FileTypeHint;
 import org.apache.lucene.store.IndexInput;
 import org.apache.lucene.store.RandomAccessInput;
 import org.apache.lucene.util.BitUtil;
+import org.apache.lucene.codecs.lucene90.fsst.FSSTCompressedAccess;
+import org.apache.lucene.codecs.lucene90.fsst.FSSTDecompressor;
+import org.apache.lucene.codecs.lucene90.fsst.FSSTSymbolTable;
 import org.apache.lucene.util.BytesRef;
 import org.apache.lucene.util.FixedBitSet;
 import org.apache.lucene.util.IOUtils;
@@ -1120,7 +1123,7 @@ final class Lucene90DocValuesProducer extends DocValuesProducer {
   }
 
   private abstract class BaseSortedDocValues extends SortedDocValues
-      implements org.apache.lucene.codecs.lucene90.fsst.FSSTCompressedAccess {
+      implements FSSTCompressedAccess {
 
     final SortedEntry entry;
     final TermsEnum termsEnum;
@@ -1135,7 +1138,7 @@ final class Lucene90DocValuesProducer extends DocValuesProducer {
         this.seqOffsets = fsstTermsDict.termOffsets;
         this.seqDataEnd = fsstTermsDict.termOffsets[(int) fsstTermsDict.termsDictSize];
         this.seqTerm = fsstTermsDict.term;
-        org.apache.lucene.codecs.lucene90.fsst.FSSTSymbolTable st = fsstTermsDict.decompressor.symbolTable();
+        FSSTSymbolTable st = fsstTermsDict.decompressor.symbolTable();
         this.seqSymLen = new int[st.len.length];
         for (int i = 0; i < st.len.length; i++) seqSymLen[i] = st.len[i] & 0xFF;
         this.seqSymVal = st.decodeLong;
@@ -1196,6 +1199,8 @@ final class Lucene90DocValuesProducer extends DocValuesProducer {
     private long[] seqSymVal;
     private int bufStart = -1;
     private int bufLen = 0;
+
+    @Override
     public int lookupTerm(BytesRef key) throws IOException {
       SeekStatus status = termsEnum.seekCeil(key);
       switch (status) {
@@ -1233,7 +1238,7 @@ final class Lucene90DocValuesProducer extends DocValuesProducer {
   }
 
   private abstract class BaseSortedSetDocValues extends SortedSetDocValues
-      implements org.apache.lucene.codecs.lucene90.fsst.FSSTCompressedAccess {
+      implements FSSTCompressedAccess {
 
     final SortedSetEntry entry;
     final IndexInput data;
@@ -1930,11 +1935,11 @@ final class Lucene90DocValuesProducer extends DocValuesProducer {
   }
 
   private class FSSTTermsDict extends BaseTermsEnum
-      implements org.apache.lucene.codecs.lucene90.fsst.FSSTCompressedAccess {
+      implements FSSTCompressedAccess {
     final long termsDictSize;
     final int[] termOffsets;
     final IndexInput bytes;
-    final org.apache.lucene.codecs.lucene90.fsst.FSSTDecompressor decompressor;
+    final FSSTDecompressor decompressor;
     final BytesRef term;
     final BytesRef compressedTerm;
     long ord = -1;
@@ -1946,9 +1951,9 @@ final class Lucene90DocValuesProducer extends DocValuesProducer {
               entry.termsDataLength + entry.symbolTableLength);
       byte[] tableBytes = new byte[entry.symbolTableLength];
       dataSlice.readBytes(tableBytes, 0, tableBytes.length);
-      org.apache.lucene.codecs.lucene90.fsst.FSSTSymbolTable symbolTable =
-          org.apache.lucene.codecs.lucene90.fsst.FSSTSymbolTable.load(tableBytes);
-      this.decompressor = new org.apache.lucene.codecs.lucene90.fsst.FSSTDecompressor(symbolTable);
+      FSSTSymbolTable symbolTable =
+          FSSTSymbolTable.load(tableBytes);
+      this.decompressor = new FSSTDecompressor(symbolTable);
       bytes = data.slice("fsst-terms-data", entry.termsDataOffset, entry.termsDataLength);
       // Load offsets from DirectMonotonic into heap int[]
       RandomAccessInput addrSlice =
@@ -1961,7 +1966,10 @@ final class Lucene90DocValuesProducer extends DocValuesProducer {
       compressedTerm = new BytesRef(entry.maxTermLength * 2);
     }
 
-    @Override public boolean hasCompressedAccess() { return true; }
+    @Override
+    public boolean hasCompressedAccess() {
+      return true;
+    }
 
     @Override
     public BytesRef lookupCompressedOrd(long ord) throws IOException {
@@ -1988,13 +1996,15 @@ final class Lucene90DocValuesProducer extends DocValuesProducer {
       term.length = decompressor.decompress(compressedTerm.bytes, 0, len, term.bytes);
     }
 
-    @Override public BytesRef next() throws IOException {
+    @Override
+    public BytesRef next() throws IOException {
       if (++ord >= termsDictSize) return null;
       decompressTerm(ord);
       return term;
     }
 
-    @Override public void seekExact(long ord) throws IOException {
+    @Override
+    public void seekExact(long ord) throws IOException {
       this.ord = ord;
       decompressTerm(ord);
     }
@@ -2016,12 +2026,35 @@ final class Lucene90DocValuesProducer extends DocValuesProducer {
       return SeekStatus.NOT_FOUND;
     }
 
-    @Override public BytesRef term() { return term; }
-    @Override public long ord() { return ord; }
-    @Override public long totalTermFreq() { return -1L; }
-    @Override public PostingsEnum postings(PostingsEnum reuse, int flags) { throw new UnsupportedOperationException(); }
-    @Override public ImpactsEnum impacts(int flags) { throw new UnsupportedOperationException(); }
-    @Override public int docFreq() { throw new UnsupportedOperationException(); }
+    @Override
+    public BytesRef term() {
+      return term;
+    }
+
+    @Override
+    public long ord() {
+      return ord;
+    }
+
+    @Override
+    public long totalTermFreq() {
+      return -1L;
+    }
+
+    @Override
+    public PostingsEnum postings(PostingsEnum reuse, int flags) {
+      throw new UnsupportedOperationException();
+    }
+
+    @Override
+    public ImpactsEnum impacts(int flags) {
+      throw new UnsupportedOperationException();
+    }
+
+    @Override
+    public int docFreq() {
+      throw new UnsupportedOperationException();
+    }
   }
   /**
    * Reader for longs split into blocks of different bits per values. The longs are requested by

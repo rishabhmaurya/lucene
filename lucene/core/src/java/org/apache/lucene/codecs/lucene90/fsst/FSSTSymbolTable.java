@@ -16,10 +16,6 @@
  */
 package org.apache.lucene.codecs.lucene90.fsst;
 
-import java.io.IOException;
-import java.nio.file.Files;
-import java.nio.file.Path;
-
 /**
  * FSST (Fast Static Symbol Table) symbol table. Maps 255 codes (0-254) to symbols of 1-8 bytes.
  * Code 255 (0xFF) is reserved as the ESCAPE code for unmatched bytes.
@@ -48,11 +44,6 @@ public final class FSSTSymbolTable {
   public final long[] decodeLong = new long[MAX_SYMBOLS];
 
   private FSSTSymbolTable() {}
-
-  /** Load a symbol table from a file. */
-  public static FSSTSymbolTable load(Path path) throws IOException {
-    return load(Files.readAllBytes(path));
-  }
 
   /** Load a symbol table from a byte array (at least {@link #SERIALIZED_SIZE} bytes). */
   public static FSSTSymbolTable load(byte[] data) {
