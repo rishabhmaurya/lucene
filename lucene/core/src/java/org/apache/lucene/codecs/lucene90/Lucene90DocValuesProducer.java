@@ -1944,6 +1944,16 @@ final class Lucene90DocValuesProducer extends DocValuesProducer {
     final BytesRef compressedTerm;
     long ord = -1;
 
+    // Buffered decode state
+    private static final int BUF_SIZE = 4096;
+    private final byte[] buf = new byte[BUF_SIZE];
+    private final IndexInput bufInput;
+    private final int dataEnd;
+    private final int[] symLen;
+    private final long[] symVal;
+    private int bufStart = -1;
+    private int bufLen = 0;
+
     FSSTTermsDict(TermsDictEntry entry, IndexInput data) throws IOException {
       this.termsDictSize = entry.termsDictSize;
       IndexInput dataSlice =
@@ -1951,10 +1961,10 @@ final class Lucene90DocValuesProducer extends DocValuesProducer {
               entry.termsDataLength + entry.symbolTableLength);
       byte[] tableBytes = new byte[entry.symbolTableLength];
       dataSlice.readBytes(tableBytes, 0, tableBytes.length);
-      FSSTSymbolTable symbolTable =
-          FSSTSymbolTable.load(tableBytes);
+      FSSTSymbolTable symbolTable = FSSTSymbolTable.load(tableBytes);
       this.decompressor = new FSSTDecompressor(symbolTable);
       bytes = data.slice("fsst-terms-data", entry.termsDataOffset, entry.termsDataLength);
+      bufInput = bytes.clone();
       // Load offsets from DirectMonotonic into heap int[]
       RandomAccessInput addrSlice =
           data.randomAccessSlice(entry.termsAddressesOffset, entry.termsAddressesLength);
@@ -1962,8 +1972,45 @@ final class Lucene90DocValuesProducer extends DocValuesProducer {
           DirectMonotonicReader.getInstance(entry.termsAddressesMeta, addrSlice, false);
       termOffsets = new int[(int) termsDictSize + 1];
       for (int i = 0; i <= termsDictSize; i++) termOffsets[i] = (int) dmOffsets.get(i);
+      dataEnd = termOffsets[(int) termsDictSize];
       term = new BytesRef(entry.maxTermLength + 7);
       compressedTerm = new BytesRef(entry.maxTermLength * 2);
+      // Pre-convert symbol lengths to int[] for hot loop
+      symLen = new int[symbolTable.len.length];
+      for (int i = 0; i < symbolTable.len.length; i++) symLen[i] = symbolTable.len[i] & 0xFF;
+      symVal = symbolTable.decodeLong;
+    }
+
+    /** Buffered lookupOrd — used by both lookupOrd and next/seekExact. */
+    BytesRef lookupOrd(int ord) throws IOException {
+      final int start = termOffsets[ord];
+      final int end = termOffsets[ord + 1];
+      int bufOff = start - bufStart;
+      if (bufOff < 0 || bufOff + (end - start) > bufLen) {
+        bufStart = start;
+        bufOff = 0;
+        int toRead = Math.min(BUF_SIZE, dataEnd - start);
+        bufInput.seek(start);
+        bufInput.readBytes(buf, 0, toRead);
+        bufLen = toRead;
+      }
+      final byte[] in = buf;
+      final byte[] out = term.bytes;
+      final int[] sl = symLen;
+      final long[] sv = symVal;
+      int pos = bufOff, outPos = 0;
+      final int posEnd = bufOff + (end - start);
+      while (pos < posEnd) {
+        int code = in[pos++] & 0xFF;
+        if (code != 0xFF) {
+          BitUtil.VH_LE_LONG.set(out, outPos, sv[code]);
+          outPos += sl[code];
+        } else {
+          out[outPos++] = in[pos++];
+        }
+      }
+      term.length = outPos;
+      return term;
     }
 
     @Override
@@ -1988,25 +2035,16 @@ final class Lucene90DocValuesProducer extends DocValuesProducer {
       return decompressor.decompress(compressed.bytes, compressed.offset, compressed.length, output);
     }
 
-    void decompressTerm(long ord) throws IOException {
-      int start = termOffsets[(int) ord];
-      int len = termOffsets[(int) ord + 1] - start;
-      bytes.seek(start);
-      bytes.readBytes(compressedTerm.bytes, 0, len);
-      term.length = decompressor.decompress(compressedTerm.bytes, 0, len, term.bytes);
-    }
-
     @Override
     public BytesRef next() throws IOException {
       if (++ord >= termsDictSize) return null;
-      decompressTerm(ord);
-      return term;
+      return lookupOrd((int) ord);
     }
 
     @Override
     public void seekExact(long ord) throws IOException {
       this.ord = ord;
-      decompressTerm(ord);
+      lookupOrd((int) ord);
     }
 
     @Override
@@ -2014,7 +2052,7 @@ final class Lucene90DocValuesProducer extends DocValuesProducer {
       long lo = 0, hi = termsDictSize - 1;
       while (lo <= hi) {
         long mid = (lo + hi) >>> 1;
-        decompressTerm(mid);
+        lookupOrd((int) mid);
         int cmp = term.compareTo(text);
         if (cmp < 0) lo = mid + 1;
         else if (cmp > 0) hi = mid - 1;
@@ -2022,7 +2060,7 @@ final class Lucene90DocValuesProducer extends DocValuesProducer {
       }
       if (lo >= termsDictSize) { ord = termsDictSize; return SeekStatus.END; }
       ord = lo;
-      decompressTerm(ord);
+      lookupOrd((int) ord);
       return SeekStatus.NOT_FOUND;
     }
 
