@@ -103,9 +103,7 @@ public class TestFSST extends LuceneTestCase {
     }
 
     double ratio = (double) compTotal / rawTotal;
-    assertTrue(
-        "Expected compression ratio below 0.9, got " + ratio,
-        ratio < 0.9);
+    assertTrue("Expected compression ratio below 0.9, got " + ratio, ratio < 0.9);
   }
 
   /** Symbol table serialization round-trip. */

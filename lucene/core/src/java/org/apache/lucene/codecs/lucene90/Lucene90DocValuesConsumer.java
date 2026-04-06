@@ -68,6 +68,7 @@ final class Lucene90DocValuesConsumer extends DocValuesConsumer {
 
   /** Term dict encoding modes written as a byte in metadata. */
   static final byte TERMS_DICT_LZ4 = 0;
+
   static final byte TERMS_DICT_FSST = 1;
 
   IndexOutput data, meta;
@@ -844,17 +845,18 @@ final class Lucene90DocValuesConsumer extends DocValuesConsumer {
     meta.writeVLong(size);
     meta.writeByte(TERMS_DICT_FSST);
 
-    // Pass 1: collect sample terms for symbol table training
+    // Collect evenly-spaced sample terms for symbol table training
     List<BytesRef> sampleTerms = new ArrayList<>();
-    long stride = Math.max(1, size / 10000);
+    int maxSamples = 10000;
+    long stride = Math.max(1, size / maxSamples);
     {
       TermsEnum iterator = values.termsEnum();
       long ord = 0;
-      for (BytesRef term = iterator.next(); term != null; term = iterator.next()) {
+      for (BytesRef term = iterator.next(); term != null; term = iterator.next(), ord++) {
         if (ord % stride == 0) {
           sampleTerms.add(BytesRef.deepCopyOf(term));
+          if (sampleTerms.size() >= maxSamples) break;
         }
-        ord++;
       }
     }
 

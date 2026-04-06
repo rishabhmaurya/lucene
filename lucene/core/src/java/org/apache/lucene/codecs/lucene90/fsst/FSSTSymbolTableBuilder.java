@@ -25,17 +25,18 @@ import java.util.PriorityQueue;
 import org.apache.lucene.util.BytesRef;
 
 /**
- * Builds an FSST symbol table. Direct port of the C reference implementation's
- * {@code buildSymbolTable} algorithm from <a href="https://github.com/cwida/fsst">cwida/fsst</a>.
+ * Builds an FSST symbol table. Direct port of the C reference implementation's {@code
+ * buildSymbolTable} algorithm from <a href="https://github.com/cwida/fsst">cwida/fsst</a>.
  *
  * <p>Key algorithm features ported from C:
+ *
  * <ul>
- *   <li>Progressive sampling (sampleFrac = 8, 38, 68, 98, 128)</li>
- *   <li>count1 for both matched symbol AND single-byte alternative</li>
- *   <li>count2 for adjacent symbol pairs (concatenation candidates)</li>
- *   <li>8x gain boost for single-byte symbols</li>
- *   <li>Minimum frequency threshold (5*sampleFrac/128)</li>
- *   <li>Best-table tracking across rounds</li>
+ *   <li>Progressive sampling (sampleFrac = 8, 38, 68, 98, 128)
+ *   <li>count1 for both matched symbol AND single-byte alternative
+ *   <li>count2 for adjacent symbol pairs (concatenation candidates)
+ *   <li>8x gain boost for single-byte symbols
+ *   <li>Minimum frequency threshold (5*sampleFrac/128)
+ *   <li>Best-table tracking across rounds
  * </ul>
  */
 public final class FSSTSymbolTableBuilder {
@@ -49,16 +50,26 @@ public final class FSSTSymbolTableBuilder {
   private FSSTSymbolTableBuilder() {}
 
   public static FSSTSymbolTable build(List<BytesRef> terms) {
-    byte[] sample = collectSample(terms);
-    if (sample.length == 0) {
+    if (terms.isEmpty()) {
       return FSSTSymbolTable.load(new byte[FSSTSymbolTable.SERIALIZED_SIZE]);
     }
-    // Split sample into individual "lines" for the algorithm
+    // Sample up to MAX_SAMPLE_BYTES worth of terms
+    int totalBytes = 0;
     List<byte[]> lines = new ArrayList<>();
-    for (BytesRef t : terms) {
+    int stride = 1;
+    if (terms.size() > 0) {
+      int estTotal = 0;
+      for (BytesRef t : terms) estTotal += t.length;
+      if (estTotal > MAX_SAMPLE_BYTES) {
+        stride = Math.max(1, estTotal / MAX_SAMPLE_BYTES);
+      }
+    }
+    for (int i = 0; i < terms.size() && totalBytes < MAX_SAMPLE_BYTES; i += stride) {
+      BytesRef t = terms.get(i);
       byte[] b = new byte[t.length];
       System.arraycopy(t.bytes, t.offset, b, 0, t.length);
       lines.add(b);
+      totalBytes += t.length;
     }
     return buildSymbolTable(lines);
   }
@@ -87,7 +98,8 @@ public final class FSSTSymbolTableBuilder {
   // --- Symbol representation: byte[] of length 1-8 ---
 
   /** Find longest matching symbol in the table. Returns code (0-255 for pseudo, 256+ for real). */
-  private static int findLongestSymbol(byte[][] symbols, int nSymbols, byte[] data, int pos, int end) {
+  private static int findLongestSymbol(
+      byte[][] symbols, int nSymbols, byte[] data, int pos, int end) {
     int bestCode = data[pos] & 0xFF; // default: pseudo-code for the byte itself
     int bestLen = 1;
     for (int i = 0; i < nSymbols; i++) {
@@ -95,9 +107,15 @@ public final class FSSTSymbolTableBuilder {
       if (sym.length > bestLen && pos + sym.length <= end) {
         boolean match = true;
         for (int j = 0; j < sym.length; j++) {
-          if (data[pos + j] != sym[j]) { match = false; break; }
+          if (data[pos + j] != sym[j]) {
+            match = false;
+            break;
+          }
         }
-        if (match) { bestCode = CODE_BASE + i; bestLen = sym.length; }
+        if (match) {
+          bestCode = CODE_BASE + i;
+          bestLen = sym.length;
+        }
       }
     }
     return bestCode;
@@ -115,7 +133,7 @@ public final class FSSTSymbolTableBuilder {
     // symbols[0..255] = pseudo-symbols (single escaped bytes)
     // symbols[256..510] = real symbols
     byte[][] symbols = new byte[CODE_MAX + 1][];
-    for (int i = 0; i < 256; i++) symbols[i] = new byte[]{(byte) i};
+    for (int i = 0; i < 256; i++) symbols[i] = new byte[] {(byte) i};
     for (int i = 256; i <= CODE_MAX; i++) symbols[i] = new byte[0];
     int nSymbols = 0;
 
@@ -262,7 +280,7 @@ public final class FSSTSymbolTableBuilder {
     for (int i = CODE_BASE; i <= CODE_MAX; i++) symbols[i] = new byte[0];
     int newNSymbols = 0;
     while (newNSymbols < 255 && !pq.isEmpty()) {
-      var entry = pq.poll();
+      Map.Entry<SymbolKey, Long> entry = pq.poll();
       symbols[CODE_BASE + newNSymbols] = entry.getKey().bytes;
       newNSymbols++;
     }
@@ -277,30 +295,6 @@ public final class FSSTSymbolTableBuilder {
       System.arraycopy(sym, 0, tableData, FSSTSymbolTable.MAX_SYMBOLS + i * 8, sym.length);
     }
     return FSSTSymbolTable.load(tableData);
-  }
-
-  private static byte[] collectSample(List<BytesRef> terms) {
-    int totalBytes = 0;
-    for (BytesRef t : terms) totalBytes += t.length;
-    if (totalBytes <= MAX_SAMPLE_BYTES) {
-      byte[] sample = new byte[totalBytes];
-      int pos = 0;
-      for (BytesRef t : terms) {
-        System.arraycopy(t.bytes, t.offset, sample, pos, t.length);
-        pos += t.length;
-      }
-      return sample;
-    }
-    byte[] sample = new byte[MAX_SAMPLE_BYTES];
-    int pos = 0;
-    int stride = Math.max(1, terms.size() / (MAX_SAMPLE_BYTES / 64));
-    for (int i = 0; i < terms.size() && pos < MAX_SAMPLE_BYTES; i += stride) {
-      BytesRef t = terms.get(i);
-      int len = Math.min(t.length, MAX_SAMPLE_BYTES - pos);
-      System.arraycopy(t.bytes, t.offset, sample, pos, len);
-      pos += len;
-    }
-    return Arrays.copyOf(sample, pos);
   }
 
   private static class SymbolKey {

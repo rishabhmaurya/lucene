@@ -118,11 +118,33 @@ public class FSSTDocValuesBenchmark {
           }
         };
 
+    // JIT warmup: index a small batch to compile hot methods
+    {
+      var warmDir = new MMapDirectory(Files.createTempDirectory("fsst-warm"));
+      IndexWriterConfig warmConf = new IndexWriterConfig().setCodec(codec);
+      try (IndexWriter w = new IndexWriter(warmDir, warmConf)) {
+        int warmCount = Math.min(5000, terms.size());
+        for (int i = 0; i < warmCount; i++) {
+          Document doc = new Document();
+          doc.add(new SortedDocValuesField("field", new BytesRef(terms.get(i))));
+          w.addDocument(doc);
+        }
+      }
+      try (DirectoryReader r = DirectoryReader.open(warmDir)) {
+        SortedDocValues dv = r.leaves().get(0).reader().getSortedDocValues("field");
+        for (int i = 0; i < dv.getValueCount(); i++) dv.lookupOrd(i);
+      }
+      for (String f : warmDir.listAll()) warmDir.deleteFile(f);
+      warmDir.close();
+    }
+
     // Index and measure indexing time
     long rawBytes = 0;
     long indexStart = System.nanoTime();
     IndexWriterConfig conf = new IndexWriterConfig().setCodec(codec);
-    conf.setUseCompoundFile(false); // separate files for size measurement
+    conf.setUseCompoundFile(false);
+    conf.setMergePolicy(org.apache.lucene.index.NoMergePolicy.INSTANCE);
+    conf.setMaxBufferedDocs(terms.size() + 1);
     try (IndexWriter writer = new IndexWriter(directory, conf)) {
       for (String term : terms) {
         Document doc = new Document();
@@ -131,7 +153,6 @@ public class FSSTDocValuesBenchmark {
         doc.add(new SortedDocValuesField("field", new BytesRef(bytes)));
         writer.addDocument(doc);
       }
-      writer.forceMerge(1);
     }
     long indexMs = (System.nanoTime() - indexStart) / 1_000_000;
 

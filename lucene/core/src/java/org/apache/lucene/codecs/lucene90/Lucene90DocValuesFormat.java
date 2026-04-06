@@ -173,8 +173,13 @@ public final class Lucene90DocValuesFormat extends DocValuesFormat {
   @Override
   public DocValuesConsumer fieldsConsumer(SegmentWriteState state) throws IOException {
     return new Lucene90DocValuesConsumer(
-        state, skipIndexIntervalSize, termsDictMode,
-        DATA_CODEC, DATA_EXTENSION, META_CODEC, META_EXTENSION);
+        state,
+        skipIndexIntervalSize,
+        termsDictMode,
+        DATA_CODEC,
+        DATA_EXTENSION,
+        META_CODEC,
+        META_EXTENSION);
   }
 
   @Override

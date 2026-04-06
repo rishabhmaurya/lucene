@@ -16,56 +16,65 @@
  */
 package org.apache.lucene.codecs.lucene90.fsst;
 
+import java.util.Arrays;
+
 /**
- * FSST compressor using greedy longest-match encoding. For each position in the input, finds the
- * longest symbol that matches and emits its code. Unmatched bytes are escaped with 0xFF prefix.
+ * FSST compressor using hash-based O(1) symbol lookup per position. For each position, hashes the
+ * first 2 bytes to find candidate symbols of length 1 and 2+. Falls back to escape for unmatched
+ * bytes.
  *
- * <p>Uses per-first-byte lists for symbol lookup — symbols are ordered by gain (not by first byte),
- * so contiguous range assumptions don't hold.
+ * <p>Based on the C reference implementation's encoding approach: a 65536-entry hash table indexed
+ * by the first two bytes, storing the longest matching symbol code for each hash slot.
  */
 public final class FSSTCompressor {
 
-  private final FSSTSymbolTable table;
+  /** Direct lookup: single-byte symbols. code1[byte] = symbol code, or -1 if none. */
+  private final int[] code1 = new int[256];
 
   /**
-   * For each possible first byte (0-255), the list of symbol codes whose first byte matches. Used
-   * for greedy longest-match lookup.
+   * Hash lookup for multi-byte symbols. For each 2-byte hash, stores the code of the longest symbol
+   * whose first 2 bytes hash to that slot. -1 if empty.
    */
-  private final int[][] codesByFirstByte;
+  private final int[] code2 = new int[65536];
 
-  /** Symbol lengths indexed by code, for fast access during compression. */
+  /** Symbol lengths indexed by code. */
   private final int[] symLen;
 
-  /** Symbol bytes indexed by code, for matching during compression. */
-  private final byte[][] symBytes;
+  /** Symbol values as longs (first 8 bytes, little-endian packed). */
+  private final long[] symVal;
 
   public FSSTCompressor(FSSTSymbolTable table) {
-    this.table = table;
     this.symLen = new int[FSSTSymbolTable.MAX_SYMBOLS];
-    this.symBytes = new byte[FSSTSymbolTable.MAX_SYMBOLS][];
+    this.symVal = new long[FSSTSymbolTable.MAX_SYMBOLS];
 
-    // Build per-first-byte lists
-    int[] counts = new int[256];
+    Arrays.fill(code1, -1);
+    Arrays.fill(code2, -1);
+
     for (int code = 0; code < FSSTSymbolTable.MAX_SYMBOLS; code++) {
-      symLen[code] = table.symbolLength(code);
-      if (symLen[code] > 0) {
-        symBytes[code] = new byte[symLen[code]];
-        table.symbolBytes(code, symBytes[code], 0);
-        counts[symBytes[code][0] & 0xFF]++;
+      int len = table.symbolLength(code);
+      symLen[code] = len;
+      symVal[code] = table.decodeLong[code];
+      if (len == 0) continue;
+
+      byte[] sb = new byte[len];
+      table.symbolBytes(code, sb, 0);
+
+      if (len == 1) {
+        code1[sb[0] & 0xFF] = code;
+      } else {
+        // Hash on first 2 bytes
+        int h = hash2(sb[0], sb[1]);
+        int existing = code2[h];
+        // Keep the longer symbol on collision
+        if (existing == -1 || len > symLen[existing]) {
+          code2[h] = code;
+        }
       }
     }
+  }
 
-    codesByFirstByte = new int[256][];
-    int[] offsets = new int[256];
-    for (int b = 0; b < 256; b++) {
-      codesByFirstByte[b] = new int[counts[b]];
-    }
-    for (int code = 0; code < FSSTSymbolTable.MAX_SYMBOLS; code++) {
-      if (symLen[code] > 0) {
-        int fb = symBytes[code][0] & 0xFF;
-        codesByFirstByte[fb][offsets[fb]++] = code;
-      }
-    }
+  private static int hash2(byte b0, byte b1) {
+    return ((b0 & 0xFF) << 8) | (b1 & 0xFF);
   }
 
   /**
@@ -76,20 +85,24 @@ public final class FSSTCompressor {
   public int compress(byte[] input, int off, int len, byte[] output) {
     int pos = off, end = off + len, outPos = 0;
     while (pos < end) {
-      int bestCode = -1, bestLen = 0;
-      int fb = input[pos] & 0xFF;
-      for (int code : codesByFirstByte[fb]) {
-        int sLen = symLen[code];
-        if (sLen > bestLen && pos + sLen <= end) {
-          if (matches(input, pos, symBytes[code], sLen)) {
-            bestCode = code;
-            bestLen = sLen;
+      // Try multi-byte symbol first (if at least 2 bytes remain)
+      if (pos + 1 < end) {
+        int h = hash2(input[pos], input[pos + 1]);
+        int code = code2[h];
+        if (code >= 0) {
+          int sLen = symLen[code];
+          if (pos + sLen <= end && matchSymbol(input, pos, symVal[code], sLen)) {
+            output[outPos++] = (byte) code;
+            pos += sLen;
+            continue;
           }
         }
       }
-      if (bestCode >= 0) {
-        output[outPos++] = (byte) bestCode;
-        pos += bestLen;
+      // Try single-byte symbol
+      int code = code1[input[pos] & 0xFF];
+      if (code >= 0) {
+        output[outPos++] = (byte) code;
+        pos++;
       } else {
         output[outPos++] = (byte) FSSTSymbolTable.ESCAPE;
         output[outPos++] = input[pos++];
@@ -98,9 +111,10 @@ public final class FSSTCompressor {
     return outPos;
   }
 
-  private static boolean matches(byte[] input, int inputOff, byte[] symbol, int len) {
+  /** Compare input bytes at pos against symbol value stored as a long. */
+  private static boolean matchSymbol(byte[] input, int pos, long symValue, int len) {
     for (int i = 0; i < len; i++) {
-      if (input[inputOff + i] != symbol[i]) return false;
+      if (input[pos + i] != (byte) (symValue >>> (i * 8))) return false;
     }
     return true;
   }

@@ -39,7 +39,9 @@ public final class FSSTSymbolTable {
 
   /** Symbol lengths — public for inlined decompression in hot paths. */
   public final byte[] len = new byte[MAX_SYMBOLS];
+
   private final byte[] symbols = new byte[MAX_SYMBOLS * 8];
+
   /** Pre-decoded symbols as longs for fast decompression. Public for inlined hot paths. */
   public final long[] decodeLong = new long[MAX_SYMBOLS];
 

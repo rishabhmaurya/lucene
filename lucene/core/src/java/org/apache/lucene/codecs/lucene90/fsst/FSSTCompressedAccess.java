@@ -26,9 +26,9 @@ import org.apache.lucene.util.BytesRef;
  * Interface for accessing FSST-compressed term bytes in the doc values term dictionary. Implemented
  * by doc values instances backed by FSST-compressed segments.
  *
- * <p>This enables aggregations to read compressed bytes directly (via {@link
- * #lookupCompressedOrd}) without decompressing, which is significantly faster than LZ4 block
- * decompression for random access patterns like cardinality aggregation.
+ * <p>This enables aggregations to read compressed bytes directly (via {@link #lookupCompressedOrd})
+ * without decompressing, which is significantly faster than LZ4 block decompression for random
+ * access patterns like cardinality aggregation.
  */
 public interface FSSTCompressedAccess {
 

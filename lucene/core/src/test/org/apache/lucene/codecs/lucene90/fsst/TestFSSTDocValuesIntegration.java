@@ -24,8 +24,8 @@ import java.util.List;
 import java.util.Set;
 import java.util.TreeSet;
 import org.apache.lucene.codecs.DocValuesFormat;
-import org.apache.lucene.codecs.lucene90.Lucene90DocValuesFormat;
 import org.apache.lucene.codecs.lucene104.Lucene104Codec;
+import org.apache.lucene.codecs.lucene90.Lucene90DocValuesFormat;
 import org.apache.lucene.document.Document;
 import org.apache.lucene.document.SortedDocValuesField;
 import org.apache.lucene.document.SortedSetDocValuesField;
@@ -36,6 +36,7 @@ import org.apache.lucene.index.LeafReader;
 import org.apache.lucene.index.NoMergePolicy;
 import org.apache.lucene.index.SortedDocValues;
 import org.apache.lucene.index.SortedSetDocValues;
+import org.apache.lucene.index.TermsEnum;
 import org.apache.lucene.store.Directory;
 import org.apache.lucene.tests.util.LuceneTestCase;
 import org.apache.lucene.util.BytesRef;
@@ -245,8 +246,7 @@ public class TestFSSTDocValuesIntegration extends LuceneTestCase {
             BytesRef compressed = fsst.lookupCompressedOrd(ord);
             int len = fsst.decompress(compressed, buf);
             assertEquals(
-                dv.lookupOrd(ord).utf8ToString(),
-                new String(buf, 0, len, StandardCharsets.UTF_8));
+                dv.lookupOrd(ord).utf8ToString(), new String(buf, 0, len, StandardCharsets.UTF_8));
           }
         }
       }
@@ -282,8 +282,7 @@ public class TestFSSTDocValuesIntegration extends LuceneTestCase {
             BytesRef compressed = fsst.lookupCompressedOrd(ord);
             int len = fsst.decompress(compressed, buf);
             assertEquals(
-                dv.lookupOrd(ord).utf8ToString(),
-                new String(buf, 0, len, StandardCharsets.UTF_8));
+                dv.lookupOrd(ord).utf8ToString(), new String(buf, 0, len, StandardCharsets.UTF_8));
           }
         }
       }
@@ -336,6 +335,338 @@ public class TestFSSTDocValuesIntegration extends LuceneTestCase {
         for (int ord = 0; ord < dv.getValueCount(); ord++) {
           assertEquals("Mismatch at ord " + ord, expected.next(), dv.lookupOrd(ord).utf8ToString());
         }
+      }
+    }
+  }
+
+  public void testSeekCeilAndLookupTerm() throws IOException {
+    Directory dir = newDirectory();
+    IndexWriterConfig iwc = new IndexWriterConfig();
+    iwc.setCodec(fsstCodec());
+    String[] terms = {
+      "http://a.com/1", "http://a.com/2", "http://b.com/1",
+      "http://c.com/1", "http://d.com/1", "http://z.com/1"
+    };
+    try (IndexWriter w = new IndexWriter(dir, iwc)) {
+      for (String t : terms) {
+        Document doc = new Document();
+        doc.add(new SortedDocValuesField("url", new BytesRef(t)));
+        w.addDocument(doc);
+      }
+    }
+    try (DirectoryReader reader = DirectoryReader.open(dir)) {
+      LeafReader leaf = reader.leaves().get(0).reader();
+      SortedDocValues dv = leaf.getSortedDocValues("url");
+      // lookupTerm — exact match
+      assertTrue(dv.lookupTerm(new BytesRef("http://a.com/1")) >= 0);
+      assertTrue(dv.lookupTerm(new BytesRef("http://z.com/1")) >= 0);
+      // lookupTerm — not found
+      int result = dv.lookupTerm(new BytesRef("http://a.com/0"));
+      assertTrue(result < 0);
+      // seekCeil via termsEnum
+      TermsEnum te = dv.termsEnum();
+      assertEquals(TermsEnum.SeekStatus.FOUND, te.seekCeil(new BytesRef("http://b.com/1")));
+      assertEquals("http://b.com/1", te.term().utf8ToString());
+      assertEquals(TermsEnum.SeekStatus.NOT_FOUND, te.seekCeil(new BytesRef("http://b.com/0")));
+      assertEquals("http://b.com/1", te.term().utf8ToString());
+      assertEquals(TermsEnum.SeekStatus.END, te.seekCeil(new BytesRef("zzz")));
+    }
+    dir.close();
+  }
+
+  public void testSequentialNext() throws IOException {
+    Directory dir = newDirectory();
+    IndexWriterConfig iwc = new IndexWriterConfig();
+    iwc.setCodec(fsstCodec());
+    TreeSet<String> expected = new TreeSet<>();
+    for (int i = 0; i < 200; i++) {
+      expected.add("http://example.com/page/" + i + "/detail?id=" + i);
+    }
+    try (IndexWriter w = new IndexWriter(dir, iwc)) {
+      for (String t : expected) {
+        Document doc = new Document();
+        doc.add(new SortedDocValuesField("url", new BytesRef(t)));
+        w.addDocument(doc);
+      }
+    }
+    try (DirectoryReader reader = DirectoryReader.open(dir)) {
+      LeafReader leaf = reader.leaves().get(0).reader();
+      SortedDocValues dv = leaf.getSortedDocValues("url");
+      // Iterate via next() and verify order matches sorted set
+      TermsEnum te = dv.termsEnum();
+      Iterator<String> it = expected.iterator();
+      BytesRef term;
+      while ((term = te.next()) != null) {
+        assertTrue(it.hasNext());
+        assertEquals(it.next(), term.utf8ToString());
+      }
+      assertFalse(it.hasNext());
+    }
+    dir.close();
+  }
+
+  /**
+   * Stress test with diverse term patterns: short, long, single-byte, multi-byte UTF-8, repeated
+   * prefixes, unique terms, empty-ish terms, and high cardinality. Tests all access paths:
+   * lookupOrd, next, seekCeil, lookupTerm, compressed access. Runs across: no-merge, force-merge,
+   * compound file on, compound file off.
+   */
+  public void testDiverseDataAllConfigurations() throws IOException {
+    // Build diverse term set
+    TreeSet<String> termSet = new TreeSet<>();
+    // Short terms (1-3 chars)
+    termSet.add("a");
+    termSet.add("ab");
+    termSet.add("z");
+    termSet.add("zz");
+    // Single byte that would be escape in FSST
+    for (int b = 0; b < 256; b += 37) {
+      termSet.add("x" + (char) ('A' + (b % 26)) + b);
+    }
+    // Long shared prefix (stress prefix coding)
+    for (int i = 0; i < 100; i++) {
+      termSet.add("http://very-long-shared-prefix.example.com/path/to/resource/" + i);
+    }
+    // Varying lengths (1 to 200 bytes)
+    for (int len = 1; len <= 200; len += 13) {
+      StringBuilder sb = new StringBuilder();
+      for (int j = 0; j < len; j++) sb.append((char) ('a' + (j % 26)));
+      termSet.add(sb.toString());
+    }
+    // Multi-byte UTF-8 (2, 3, 4 byte chars)
+    termSet.add("café");
+    termSet.add("日本語テスト");
+    termSet.add("Ελληνικά");
+    termSet.add("emoji\uD83D\uDE00test");
+    termSet.add("mixed_αβγ_123");
+    // Duplicate-heavy: many docs mapping to few terms
+    String[] heavyTerms = {"popular_term_A", "popular_term_B", "popular_term_C"};
+    // Numeric-like strings
+    for (int i = 0; i < 50; i++) {
+      termSet.add(String.format(java.util.Locale.ROOT, "%010d", i * 7919));
+    }
+    // Terms that differ only in last byte
+    for (int i = 0; i < 20; i++) {
+      termSet.add("identical_prefix_" + (char) ('a' + i));
+    }
+
+    List<String> sortedTerms = new ArrayList<>(termSet);
+    int uniqueCount = sortedTerms.size();
+
+    // Test 4 configurations
+    boolean[][] configs = {
+      {false, false}, // no merge, no compound
+      {false, true}, // no merge, compound
+      {true, false}, // force merge, no compound
+      {true, true}, // force merge, compound
+    };
+
+    for (boolean[] config : configs) {
+      boolean doMerge = config[0];
+      boolean useCompound = config[1];
+
+      try (Directory dir = newDirectory()) {
+        Lucene104Codec codec = fsstCodec();
+
+        // Index: split docs across segments if merging, else single segment
+        if (doMerge) {
+          IndexWriterConfig iwc =
+              new IndexWriterConfig()
+                  .setCodec(codec)
+                  .setMergePolicy(NoMergePolicy.INSTANCE)
+                  .setUseCompoundFile(useCompound);
+          try (IndexWriter w = new IndexWriter(dir, iwc)) {
+            int half = sortedTerms.size() / 2;
+            // Segment 1: first half + heavy terms
+            for (int i = 0; i < half; i++) {
+              Document doc = new Document();
+              doc.add(new SortedDocValuesField("val", new BytesRef(sortedTerms.get(i))));
+              w.addDocument(doc);
+            }
+            for (String ht : heavyTerms) {
+              Document doc = new Document();
+              doc.add(new SortedDocValuesField("val", new BytesRef(ht)));
+              w.addDocument(doc);
+            }
+            w.flush();
+            // Segment 2: second half + heavy terms (overlap)
+            for (int i = half; i < sortedTerms.size(); i++) {
+              Document doc = new Document();
+              doc.add(new SortedDocValuesField("val", new BytesRef(sortedTerms.get(i))));
+              w.addDocument(doc);
+            }
+            for (String ht : heavyTerms) {
+              Document doc = new Document();
+              doc.add(new SortedDocValuesField("val", new BytesRef(ht)));
+              w.addDocument(doc);
+            }
+            w.flush();
+          }
+          // Merge
+          IndexWriterConfig mergeConf =
+              new IndexWriterConfig().setCodec(codec).setUseCompoundFile(useCompound);
+          try (IndexWriter w = new IndexWriter(dir, mergeConf)) {
+            w.forceMerge(1);
+          }
+        } else {
+          IndexWriterConfig iwc =
+              new IndexWriterConfig().setCodec(codec).setUseCompoundFile(useCompound);
+          try (IndexWriter w = new IndexWriter(dir, iwc)) {
+            for (String t : sortedTerms) {
+              Document doc = new Document();
+              doc.add(new SortedDocValuesField("val", new BytesRef(t)));
+              w.addDocument(doc);
+            }
+            // Add duplicates
+            for (int i = 0; i < 50; i++) {
+              Document doc = new Document();
+              doc.add(
+                  new SortedDocValuesField("val", new BytesRef(heavyTerms[i % heavyTerms.length])));
+              w.addDocument(doc);
+            }
+          }
+        }
+
+        // Verify
+        String label = "merge=" + doMerge + " compound=" + useCompound;
+        try (DirectoryReader reader = DirectoryReader.open(dir)) {
+          assertEquals(label + " should have 1 segment", 1, reader.leaves().size());
+          SortedDocValues dv = reader.leaves().get(0).reader().getSortedDocValues("val");
+          assertNotNull(label, dv);
+
+          // Add heavy terms to expected set
+          for (String ht : heavyTerms) termSet.add(ht);
+          List<String> expected = new ArrayList<>(termSet);
+          assertEquals(label + " value count", expected.size(), dv.getValueCount());
+
+          // 1. lookupOrd: verify all ordinals
+          for (int ord = 0; ord < dv.getValueCount(); ord++) {
+            assertEquals(
+                label + " lookupOrd(" + ord + ")",
+                expected.get(ord),
+                dv.lookupOrd(ord).utf8ToString());
+          }
+
+          // 2. Random access lookupOrd (non-sequential)
+          int[] randomOrds = {
+            0,
+            dv.getValueCount() - 1,
+            dv.getValueCount() / 2,
+            1,
+            dv.getValueCount() / 3,
+            dv.getValueCount() - 2
+          };
+          for (int ord : randomOrds) {
+            assertEquals(
+                label + " random lookupOrd(" + ord + ")",
+                expected.get(ord),
+                dv.lookupOrd(ord).utf8ToString());
+          }
+
+          // 3. next() sequential iteration
+          TermsEnum te = dv.termsEnum();
+          int count = 0;
+          BytesRef term;
+          while ((term = te.next()) != null) {
+            assertEquals(label + " next() ord=" + count, expected.get(count), term.utf8ToString());
+            count++;
+          }
+          assertEquals(label + " next() count", expected.size(), count);
+
+          // 4. seekCeil
+          te = dv.termsEnum();
+          // Exact match
+          assertEquals(
+              label + " seekCeil exact",
+              TermsEnum.SeekStatus.FOUND,
+              te.seekCeil(new BytesRef(expected.get(0))));
+          assertEquals(expected.get(0), te.term().utf8ToString());
+          // Not found — should land past last term
+          assertEquals(
+              label + " seekCeil past end",
+              TermsEnum.SeekStatus.END,
+              te.seekCeil(new BytesRef("\uffff\uffff\uffff")));
+          // seekCeil on term before first
+          assertEquals(
+              label + " seekCeil before first",
+              TermsEnum.SeekStatus.NOT_FOUND,
+              te.seekCeil(new BytesRef("")));
+
+          // 5. lookupTerm
+          for (int i = 0; i < Math.min(20, expected.size()); i++) {
+            assertTrue(
+                label + " lookupTerm(" + expected.get(i) + ")",
+                dv.lookupTerm(new BytesRef(expected.get(i))) >= 0);
+          }
+          assertTrue(
+              label + " lookupTerm missing",
+              dv.lookupTerm(new BytesRef("NONEXISTENT_TERM_XYZ")) < 0);
+
+          // 6. Compressed access
+          if (dv instanceof FSSTCompressedAccess fsst && fsst.hasCompressedAccess()) {
+            byte[] buf = new byte[4096];
+            for (int ord = 0; ord < dv.getValueCount(); ord++) {
+              BytesRef compressed = fsst.lookupCompressedOrd(ord);
+              assertNotNull(label + " compressed ord=" + ord, compressed);
+              int len = fsst.decompress(compressed, buf);
+              assertEquals(
+                  label + " decompress ord=" + ord,
+                  expected.get(ord),
+                  new String(buf, 0, len, StandardCharsets.UTF_8));
+            }
+          }
+        }
+      }
+    }
+  }
+
+  /** Test SortedSet with diverse multi-valued data across merge and compound configs. */
+  public void testSortedSetDiverse() throws IOException {
+    TreeSet<String> allTerms = new TreeSet<>();
+    // Mix of patterns
+    for (int i = 0; i < 200; i++) {
+      allTerms.add("category_" + (i % 30));
+      allTerms.add("tag:" + String.format(java.util.Locale.ROOT, "%05d", i));
+      if (i % 10 == 0) allTerms.add("long_prefix_shared_across_many_terms_" + i);
+    }
+    List<String> termList = new ArrayList<>(allTerms);
+
+    try (Directory dir = newDirectory()) {
+      Lucene104Codec codec = fsstCodec();
+      IndexWriterConfig iwc = new IndexWriterConfig().setCodec(codec);
+      try (IndexWriter w = new IndexWriter(dir, iwc)) {
+        // Each doc gets 1-5 values
+        for (int d = 0; d < 500; d++) {
+          Document doc = new Document();
+          int numVals = 1 + (d % 5);
+          for (int v = 0; v < numVals; v++) {
+            String t = termList.get((d * 3 + v) % termList.size());
+            doc.add(new SortedSetDocValuesField("tags", new BytesRef(t)));
+          }
+          w.addDocument(doc);
+        }
+      }
+      try (DirectoryReader reader = DirectoryReader.open(dir)) {
+        SortedSetDocValues dv = reader.leaves().get(0).reader().getSortedSetDocValues("tags");
+        assertNotNull(dv);
+        assertEquals(allTerms.size(), dv.getValueCount());
+        // Verify sorted order
+        List<String> expected = new ArrayList<>(allTerms);
+        for (int ord = 0; ord < dv.getValueCount(); ord++) {
+          assertEquals(
+              "sortedset lookupOrd(" + ord + ")",
+              expected.get(ord),
+              dv.lookupOrd(ord).utf8ToString());
+        }
+        // next() iteration
+        TermsEnum te = dv.termsEnum();
+        int count = 0;
+        BytesRef term;
+        while ((term = te.next()) != null) {
+          assertEquals(expected.get(count), term.utf8ToString());
+          count++;
+        }
+        assertEquals(expected.size(), count);
       }
     }
   }
