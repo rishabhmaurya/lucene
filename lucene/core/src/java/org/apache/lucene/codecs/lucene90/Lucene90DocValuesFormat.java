@@ -138,27 +138,50 @@ import org.apache.lucene.util.packed.DirectWriter;
  */
 public final class Lucene90DocValuesFormat extends DocValuesFormat {
 
-  private final int skipIndexIntervalSize;
-
-  /** Default constructor. */
-  public Lucene90DocValuesFormat() {
-    this(DEFAULT_SKIP_INDEX_INTERVAL_SIZE);
+  /** Term dictionary encoding mode. */
+  public enum TermsDictMode {
+    /** LZ4 block compression with prefix encoding (default). */
+    LZ4,
+    /** FSST per-term compression with O(1) random access. */
+    FSST,
+    /** FSST+ with prefix extraction and O(1) random access. */
+    FSST_PLUS
   }
 
-  /** Doc values fields format with specified skipIndexIntervalSize. */
+  private final int skipIndexIntervalSize;
+  private final TermsDictMode termsDictMode;
+
+  /** Default constructor — uses LZ4 term dict. */
+  public Lucene90DocValuesFormat() {
+    this(DEFAULT_SKIP_INDEX_INTERVAL_SIZE, TermsDictMode.LZ4);
+  }
+
+  /** Doc values fields format with specified skipIndexIntervalSize and LZ4 term dict. */
   public Lucene90DocValuesFormat(int skipIndexIntervalSize) {
+    this(skipIndexIntervalSize, TermsDictMode.LZ4);
+  }
+
+  /** Doc values fields format with specified skipIndexIntervalSize and term dict mode. */
+  public Lucene90DocValuesFormat(int skipIndexIntervalSize, TermsDictMode termsDictMode) {
     super("Lucene90");
     if (skipIndexIntervalSize < 2) {
       throw new IllegalArgumentException(
           "skipIndexIntervalSize must be > 1, got [" + skipIndexIntervalSize + "]");
     }
     this.skipIndexIntervalSize = skipIndexIntervalSize;
+    this.termsDictMode = termsDictMode;
   }
 
   @Override
   public DocValuesConsumer fieldsConsumer(SegmentWriteState state) throws IOException {
     return new Lucene90DocValuesConsumer(
-        state, skipIndexIntervalSize, DATA_CODEC, DATA_EXTENSION, META_CODEC, META_EXTENSION);
+        state,
+        skipIndexIntervalSize,
+        termsDictMode,
+        DATA_CODEC,
+        DATA_EXTENSION,
+        META_CODEC,
+        META_EXTENSION);
   }
 
   @Override
@@ -172,7 +195,8 @@ public final class Lucene90DocValuesFormat extends DocValuesFormat {
   static final String META_CODEC = "Lucene90DocValuesMetadata";
   static final String META_EXTENSION = "dvm";
   static final int VERSION_START = 0;
-  static final int VERSION_CURRENT = VERSION_START;
+  static final int VERSION_FSST = 1;
+  static final int VERSION_CURRENT = VERSION_FSST;
 
   // indicates docvalues type
   static final byte NUMERIC = 0;

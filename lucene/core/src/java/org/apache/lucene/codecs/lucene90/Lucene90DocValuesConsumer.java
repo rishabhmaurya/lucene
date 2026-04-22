@@ -63,22 +63,30 @@ import org.apache.lucene.util.packed.DirectWriter;
 /** writer for {@link Lucene90DocValuesFormat} */
 final class Lucene90DocValuesConsumer extends DocValuesConsumer {
 
+  /** Term dict encoding modes written as a byte in metadata. */
+  static final byte TERMS_DICT_LZ4 = 0;
+
+  static final byte TERMS_DICT_FSST = 1;
+  static final byte TERMS_DICT_FSST_PLUS = 2;
+
   IndexOutput data, meta;
   final int maxDoc;
   private byte[] termsDictBuffer;
   private final int skipIndexIntervalSize;
+  private final Lucene90DocValuesFormat.TermsDictMode termsDictMode;
 
   /** expert: Creates a new writer */
   public Lucene90DocValuesConsumer(
       SegmentWriteState state,
       int skipIndexIntervalSize,
+      Lucene90DocValuesFormat.TermsDictMode termsDictMode,
       String dataCodec,
       String dataExtension,
       String metaCodec,
       String metaExtension)
       throws IOException {
     this.termsDictBuffer = new byte[1 << 14];
-    boolean success = false;
+    this.termsDictMode = termsDictMode;
     try {
       String dataName =
           IndexFileNames.segmentFileName(
@@ -102,32 +110,29 @@ final class Lucene90DocValuesConsumer extends DocValuesConsumer {
           state.segmentSuffix);
       maxDoc = state.segmentInfo.maxDoc();
       this.skipIndexIntervalSize = skipIndexIntervalSize;
-      success = true;
-    } finally {
-      if (!success) {
-        IOUtils.closeWhileHandlingException(this);
-      }
+    } catch (Throwable t) {
+      IOUtils.closeWhileSuppressingExceptions(t, this);
+      throw t;
     }
   }
 
   @Override
   public void close() throws IOException {
-    boolean success = false;
     try {
-      if (meta != null) {
-        meta.writeInt(-1); // write EOF marker
-        CodecUtil.writeFooter(meta); // write checksum
+      try {
+        if (meta != null) {
+          meta.writeInt(-1); // write EOF marker
+          CodecUtil.writeFooter(meta); // write checksum
+        }
+        if (data != null) {
+          CodecUtil.writeFooter(data); // write checksum
+        }
+      } catch (Throwable t) {
+        IOUtils.closeWhileSuppressingExceptions(t, data, meta);
+        throw t;
       }
-      if (data != null) {
-        CodecUtil.writeFooter(data); // write checksum
-      }
-      success = true;
+      IOUtils.close(data, meta);
     } finally {
-      if (success) {
-        IOUtils.close(data, meta);
-      } else {
-        IOUtils.closeWhileHandlingException(data, meta);
-      }
       meta = data = null;
     }
   }
@@ -708,12 +713,23 @@ final class Lucene90DocValuesConsumer extends DocValuesConsumer {
       meta.writeByte((byte) 0); // multiValued (0 = singleValued)
     }
     writeValues(field, producer, true);
-    addTermsDict(DocValues.singleton(valuesProducer.getSorted(field)));
+    dispatchAddTermsDict(DocValues.singleton(valuesProducer.getSorted(field)));
+  }
+
+  private void dispatchAddTermsDict(SortedSetDocValues values) throws IOException {
+    if (termsDictMode == Lucene90DocValuesFormat.TermsDictMode.FSST_PLUS) {
+      FSSTTermsWriter.writeFSSTPlus(meta, data, values);
+    } else if (termsDictMode == Lucene90DocValuesFormat.TermsDictMode.FSST) {
+      FSSTTermsWriter.writeFSST(meta, data, values);
+    } else {
+      addTermsDict(values);
+    }
   }
 
   private void addTermsDict(SortedSetDocValues values) throws IOException {
     final long size = values.getValueCount();
     meta.writeVLong(size);
+    meta.writeByte(TERMS_DICT_LZ4);
 
     int blockMask = Lucene90DocValuesFormat.TERMS_DICT_BLOCK_LZ4_MASK;
     int shift = Lucene90DocValuesFormat.TERMS_DICT_BLOCK_LZ4_SHIFT;
@@ -794,7 +810,7 @@ final class Lucene90DocValuesConsumer extends DocValuesConsumer {
     meta.writeLong(data.getFilePointer() - start);
 
     // Now write the reverse terms index
-    writeTermsIndex(values);
+    writeTermsIndex(meta, data, values);
   }
 
   private int compressAndGetTermsDictBlockLength(
@@ -815,7 +831,29 @@ final class Lucene90DocValuesConsumer extends DocValuesConsumer {
     return bufferedOutput;
   }
 
-  private void writeTermsIndex(SortedSetDocValues values) throws IOException {
+  /**
+   * Writes a FSST-compressed term dictionary. Each term is independently compressed with a shared
+   * symbol table trained on the terms. Per-term offsets enable O(1) random access.
+   *
+   * <p>Format in .dvd: [symbol_table_bytes] [compressed_term_0] [compressed_term_1] ... [offsets]
+   *
+   * <p>Format in .dvm: encoding_byte(TERMS_DICT_FSST) termsDictSize symbolTableLength
+   * blockShift(for offsets) maxTermLength dataOffset dataLength addressOffset addressLength
+   */
+
+
+  /**
+   * FSST+ term dictionary: prefix extraction via DP + FSST compression on suffixes.
+   *
+   * <p>On-disk layout per block of up to 128 terms:
+   * <ul>
+   *   <li>Block header: numStrings(1B), numChunks(1B), suffixOffsets[numStrings](2B each)
+   *   <li>Prefix data: per chunk [prefixCompressedLen(2B), FSST(prefix)]
+   *   <li>Suffix data: per string [prefixLen(1B), jumpBack(2B if prefixLen>0), FSST(suffix)]
+   * </ul>
+   */
+
+  static void writeTermsIndex(IndexOutput meta, IndexOutput data, SortedSetDocValues values) throws IOException {
     final long size = values.getValueCount();
     meta.writeInt(Lucene90DocValuesFormat.TERMS_DICT_REVERSE_INDEX_SHIFT);
     long start = data.getFilePointer();
@@ -1004,6 +1042,6 @@ final class Lucene90DocValuesConsumer extends DocValuesConsumer {
         },
         true);
 
-    addTermsDict(valuesProducer.getSortedSet(field));
+    dispatchAddTermsDict(valuesProducer.getSortedSet(field));
   }
 }

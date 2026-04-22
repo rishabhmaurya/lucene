@@ -49,6 +49,7 @@ import org.apache.lucene.store.DataInput;
 import org.apache.lucene.store.FileTypeHint;
 import org.apache.lucene.store.IndexInput;
 import org.apache.lucene.store.RandomAccessInput;
+import org.apache.lucene.util.BitUtil;
 import org.apache.lucene.util.BytesRef;
 import org.apache.lucene.util.FixedBitSet;
 import org.apache.lucene.util.IOUtils;
@@ -308,8 +309,25 @@ final class Lucene90DocValuesProducer extends DocValuesProducer {
     return entry;
   }
 
-  private static void readTermDict(IndexInput meta, TermsDictEntry entry) throws IOException {
+  private void readTermDict(IndexInput meta, TermsDictEntry entry) throws IOException {
     entry.termsDictSize = meta.readVLong();
+
+    if (version >= Lucene90DocValuesFormat.VERSION_FSST) {
+      entry.encoding = meta.readByte();
+    } else {
+      entry.encoding = Lucene90DocValuesConsumer.TERMS_DICT_LZ4;
+    }
+
+    if (entry.encoding == Lucene90DocValuesConsumer.TERMS_DICT_FSST) {
+      readTermDictFSST(meta, entry);
+    } else if (entry.encoding == Lucene90DocValuesConsumer.TERMS_DICT_FSST_PLUS) {
+      readTermDictFSSTPlus(meta, entry);
+    } else {
+      readTermDictLZ4(meta, entry);
+    }
+  }
+
+  private static void readTermDictLZ4(IndexInput meta, TermsDictEntry entry) throws IOException {
     final int blockShift = meta.readInt();
     final long addressesSize =
         (entry.termsDictSize + (1L << TERMS_DICT_BLOCK_LZ4_SHIFT) - 1)
@@ -322,6 +340,54 @@ final class Lucene90DocValuesProducer extends DocValuesProducer {
     entry.termsAddressesOffset = meta.readLong();
     entry.termsAddressesLength = meta.readLong();
     entry.termsDictIndexShift = meta.readInt();
+    final long indexSize =
+        (entry.termsDictSize + (1L << entry.termsDictIndexShift) - 1) >>> entry.termsDictIndexShift;
+    entry.termsIndexAddressesMeta = DirectMonotonicReader.loadMeta(meta, 1 + indexSize, blockShift);
+    entry.termsIndexOffset = meta.readLong();
+    entry.termsIndexLength = meta.readLong();
+    entry.termsIndexAddressesOffset = meta.readLong();
+    entry.termsIndexAddressesLength = meta.readLong();
+  }
+
+  private static void readTermDictFSST(IndexInput meta, TermsDictEntry entry) throws IOException {
+    entry.symbolTableLength = meta.readVInt();
+    entry.maxTermLength = meta.readInt();
+    entry.termsDataOffset = meta.readLong();
+    entry.termsDataLength = meta.readLong();
+    // Term offsets (DirectMonotonic — loaded into heap int[] at open time)
+    final int addrBlockShift = meta.readInt();
+    entry.termsAddressesMeta =
+        DirectMonotonicReader.loadMeta(meta, entry.termsDictSize + 1, addrBlockShift);
+    entry.termsAddressesOffset = meta.readLong();
+    entry.termsAddressesLength = meta.readLong();
+    // Reverse index
+    entry.termsDictIndexShift = meta.readInt();
+    final int blockShift = meta.readInt();
+    final long indexSize =
+        (entry.termsDictSize + (1L << entry.termsDictIndexShift) - 1) >>> entry.termsDictIndexShift;
+    entry.termsIndexAddressesMeta = DirectMonotonicReader.loadMeta(meta, 1 + indexSize, blockShift);
+    entry.termsIndexOffset = meta.readLong();
+    entry.termsIndexLength = meta.readLong();
+    entry.termsIndexAddressesOffset = meta.readLong();
+    entry.termsIndexAddressesLength = meta.readLong();
+  }
+
+  private static void readTermDictFSSTPlus(IndexInput meta, TermsDictEntry entry)
+      throws IOException {
+    entry.symbolTableLength = meta.readVInt();
+    entry.maxTermLength = meta.readVInt();
+    entry.numBlocks = meta.readVInt();
+    entry.termsDataOffset = meta.readLong();
+    entry.termsDataLength = meta.readLong();
+    // Block start offsets
+    final int addrBlockShift = meta.readInt();
+    entry.termsAddressesMeta =
+        DirectMonotonicReader.loadMeta(meta, entry.numBlocks, addrBlockShift);
+    entry.termsAddressesOffset = meta.readLong();
+    entry.termsAddressesLength = meta.readLong();
+    // Reverse index
+    entry.termsDictIndexShift = meta.readInt();
+    final int blockShift = meta.readInt();
     final long indexSize =
         (entry.termsDictSize + (1L << entry.termsDictIndexShift) - 1) >>> entry.termsDictIndexShift;
     entry.termsIndexAddressesMeta = DirectMonotonicReader.loadMeta(meta, 1 + indexSize, blockShift);
@@ -390,7 +456,8 @@ final class Lucene90DocValuesProducer extends DocValuesProducer {
     DirectMonotonicReader.Meta addressesMeta;
   }
 
-  private static class TermsDictEntry {
+  static class TermsDictEntry {
+    byte encoding; // TERMS_DICT_LZ4 or TERMS_DICT_FSST
     long termsDictSize;
     DirectMonotonicReader.Meta termsAddressesMeta;
     int maxTermLength;
@@ -405,7 +472,14 @@ final class Lucene90DocValuesProducer extends DocValuesProducer {
     long termsIndexAddressesOffset;
     long termsIndexAddressesLength;
 
+    // LZ4-specific
     int maxBlockLength;
+
+    // FSST-specific
+    int symbolTableLength;
+
+    // FSST+-specific
+    int numBlocks;
   }
 
   private static class SortedEntry {
@@ -1082,40 +1156,31 @@ final class Lucene90DocValuesProducer extends DocValuesProducer {
   private abstract class BaseSortedDocValues extends SortedDocValues {
 
     final SortedEntry entry;
-    final TermsEnum termsEnum;
+    final TermsDictReader termsDictReader;
 
     BaseSortedDocValues(SortedEntry entry) throws IOException {
       this.entry = entry;
-      this.termsEnum = termsEnum();
+      this.termsDictReader = TermsDictReader.create(entry.termsDictEntry, data, merging);
     }
 
     @Override
     public int getValueCount() {
-      return Math.toIntExact(entry.termsDictEntry.termsDictSize);
+      return Math.toIntExact(termsDictReader.getValueCount());
     }
 
     @Override
     public BytesRef lookupOrd(int ord) throws IOException {
-      termsEnum.seekExact(ord);
-      return termsEnum.term();
+      return termsDictReader.lookupOrd(ord);
     }
 
     @Override
     public int lookupTerm(BytesRef key) throws IOException {
-      SeekStatus status = termsEnum.seekCeil(key);
-      switch (status) {
-        case FOUND:
-          return Math.toIntExact(termsEnum.ord());
-        case NOT_FOUND:
-        case END:
-        default:
-          return Math.toIntExact(-1L - termsEnum.ord());
-      }
+      return Math.toIntExact(termsDictReader.lookupTerm(key));
     }
 
     @Override
     public TermsEnum termsEnum() throws IOException {
-      return new TermsDict(entry.termsDictEntry, data);
+      return termsDictReader.termsEnum();
     }
   }
 
@@ -1123,45 +1188,36 @@ final class Lucene90DocValuesProducer extends DocValuesProducer {
 
     final SortedSetEntry entry;
     final IndexInput data;
-    final TermsEnum termsEnum;
+    final TermsDictReader termsDictReader;
 
     BaseSortedSetDocValues(SortedSetEntry entry, IndexInput data) throws IOException {
       this.entry = entry;
       this.data = data;
-      this.termsEnum = termsEnum();
+      this.termsDictReader = TermsDictReader.create(entry.termsDictEntry, data, merging);
     }
 
     @Override
     public long getValueCount() {
-      return entry.termsDictEntry.termsDictSize;
+      return termsDictReader.getValueCount();
     }
 
     @Override
     public BytesRef lookupOrd(long ord) throws IOException {
-      termsEnum.seekExact(ord);
-      return termsEnum.term();
+      return termsDictReader.lookupOrd((int) ord);
     }
 
     @Override
     public long lookupTerm(BytesRef key) throws IOException {
-      SeekStatus status = termsEnum.seekCeil(key);
-      switch (status) {
-        case FOUND:
-          return termsEnum.ord();
-        case NOT_FOUND:
-        case END:
-        default:
-          return -1L - termsEnum.ord();
-      }
+      return termsDictReader.lookupTerm(key);
     }
 
     @Override
     public TermsEnum termsEnum() throws IOException {
-      return new TermsDict(entry.termsDictEntry, data);
+      return termsDictReader.termsEnum();
     }
   }
 
-  private class TermsDict extends BaseTermsEnum {
+  static class TermsDict extends BaseTermsEnum {
     static final int LZ4_DECOMPRESSOR_PADDING = 7;
 
     final TermsDictEntry entry;
@@ -1177,7 +1233,7 @@ final class Lucene90DocValuesProducer extends DocValuesProducer {
     long currentCompressedBlockStart = -1;
     long currentCompressedBlockEnd = -1;
 
-    TermsDict(TermsDictEntry entry, IndexInput data) throws IOException {
+    TermsDict(TermsDictEntry entry, IndexInput data, boolean merging) throws IOException {
       this.entry = entry;
       RandomAccessInput addressesSlice =
           data.randomAccessSlice(entry.termsAddressesOffset, entry.termsAddressesLength);
@@ -1791,8 +1847,12 @@ final class Lucene90DocValuesProducer extends DocValuesProducer {
   }
 
   /**
-   * Reader for longs split into blocks of different bits per values. The longs are requested by
-   * index and must be accessed in monotonically increasing order.
+   * FSST term dictionary for sorted/sorted-set doc values. Each term is independently compressed,
+   * enabling O(1) random access by ordinal (unlike LZ4 which requires block decompression).
+   *
+   * <p>On-disk: symbol table (2295B) + compressed terms + DirectMonotonic offsets. At segment open,
+   * offsets are loaded into a heap int[] for direct indexing. A 128-byte read-ahead buffer reduces
+   * mmap overhead for sequential access while keeping memory footprint small.
    */
   // Note: The order requirement could be removed as the jump-tables allow for backwards iteration
   // Note 2: The rankSlice is only used if an advance of > 1 block is called. Its construction could
