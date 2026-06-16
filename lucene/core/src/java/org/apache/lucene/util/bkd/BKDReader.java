@@ -44,6 +44,8 @@ public class BKDReader extends PointValues {
   final int docCount;
   final int version;
   final long minLeafBlockFP;
+  // if true, leaf blocks store only doc-ids (no values); see BKDWriter.VERSION_DOC_IDS_ONLY_LEAVES
+  final boolean docIdsOnly;
 
   private final long indexStartPointer;
   private final int numIndexBytes;
@@ -59,6 +61,11 @@ public class BKDReader extends PointValues {
     version =
         CodecUtil.checkHeader(
             metaIn, BKDWriter.CODEC_NAME, BKDWriter.VERSION_START, BKDWriter.VERSION_CURRENT);
+    if (version >= BKDWriter.VERSION_DOC_IDS_ONLY_LEAVES) {
+      docIdsOnly = metaIn.readByte() != 0;
+    } else {
+      docIdsOnly = false;
+    }
     final int numDims = metaIn.readVInt();
     final int numIndexDims;
     if (version >= BKDWriter.VERSION_SELECTIVE_INDEXING) {
@@ -192,7 +199,8 @@ public class BKDReader extends PointValues {
         pointCount,
         minPackedValue,
         maxPackedValue,
-        isTreeBalanced);
+        isTreeBalanced,
+        docIdsOnly);
   }
 
   private static class BKDPointTree implements PointTree {
@@ -246,6 +254,8 @@ public class BKDReader extends PointValues {
     private final DocIdsWriter docIdsWriter;
     // if true the tree is balanced, otherwise unbalanced
     private final boolean isTreeBalanced;
+    // if true, leaf blocks store only doc-ids (no values); crossing leaves are emitted whole
+    private final boolean docIdsOnly;
     private final IntsRef scratchIntsRef = new IntsRef();
 
     {
@@ -261,7 +271,8 @@ public class BKDReader extends PointValues {
         long pointCount,
         byte[] minPackedValue,
         byte[] maxPackedValue,
-        boolean isTreeBalanced)
+        boolean isTreeBalanced,
+        boolean docIdsOnly)
         throws IOException {
       this(
           innerNodes,
@@ -279,7 +290,8 @@ public class BKDReader extends PointValues {
           new byte[config.packedIndexBytesLength()],
           new byte[config.packedIndexBytesLength()],
           new int[config.numDims()],
-          isTreeBalanced);
+          isTreeBalanced,
+          docIdsOnly);
       // read root node
       readNodeData(false);
     }
@@ -300,9 +312,11 @@ public class BKDReader extends PointValues {
         byte[] scratchMinIndexPackedValue,
         byte[] scratchMaxIndexPackedValue,
         int[] commonPrefixLengths,
-        boolean isTreeBalanced) {
+        boolean isTreeBalanced,
+        boolean docIdsOnly) {
       this.config = config;
       this.version = version;
+      this.docIdsOnly = docIdsOnly;
       this.nodeID = nodeID;
       this.nodeRoot = nodeID;
       this.level = level;
@@ -357,7 +371,8 @@ public class BKDReader extends PointValues {
               scratchMinIndexPackedValue,
               scratchMaxIndexPackedValue,
               commonPrefixLengths,
-              isTreeBalanced);
+              isTreeBalanced,
+              docIdsOnly);
       index.leafBlockFPStack[index.level] = leafBlockFPStack[level];
       if (isLeafNode() == false) {
         // copy node data
@@ -638,6 +653,15 @@ public class BKDReader extends PointValues {
     private void visitDocValues(PointValues.IntersectVisitor visitor, long fp) throws IOException {
       // Leaf node; scan and filter all points in this block:
       int count = readDocIDs(leafNodes, fp, scratchIterator);
+      if (docIdsOnly) {
+        // Value-free leaf: no packed values are stored, so we cannot refine a crossing cell.
+        // Emit every doc-id in the leaf — a conservative super-set the caller must re-check.
+        visitor.grow(count);
+        scratchIntsRef.ints = scratchIterator.docIDs;
+        scratchIntsRef.length = count;
+        visitor.visit(scratchIntsRef);
+        return;
+      }
       if (version >= BKDWriter.VERSION_LOW_CARDINALITY_LEAVES) {
         visitDocValuesWithCardinality(
             commonPrefixLengths,

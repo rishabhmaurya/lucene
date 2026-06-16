@@ -89,7 +89,14 @@ public class BKDWriter implements Closeable {
   public static final int VERSION_LOW_CARDINALITY_LEAVES = 7;
   public static final int VERSION_META_FILE = 9;
   public static final int VERSION_VECTORIZE_BPV24_AND_INTRODUCE_BPV21 = 10;
-  public static final int VERSION_CURRENT = VERSION_VECTORIZE_BPV24_AND_INTRODUCE_BPV21;
+  // Adds a one-byte "docIdsOnly" flag to the metadata. When set, leaf blocks store ONLY the
+  // doc-id block (no common prefixes, no packed values) and the per-leaf doc-ids are written in
+  // ascending order so {@link DocIdsWriter} can pick the bitset/continuous encodings. The
+  // navigable split tree (.kdi) is still built from the values, so range navigation works; leaves
+  // that cross the query box are emitted whole (a conservative super-set) since their per-point
+  // values are unavailable. Default (flag unset) is byte-for-byte identical to the prior version.
+  public static final int VERSION_DOC_IDS_ONLY_LEAVES = 11;
+  public static final int VERSION_CURRENT = VERSION_DOC_IDS_ONLY_LEAVES;
 
   /** Number of splits before we compute the exact bounding box of an inner node. */
   private static final int SPLITS_BEFORE_EXACT_BOUNDS = 4;
@@ -137,6 +144,13 @@ public class BKDWriter implements Closeable {
   private final int maxDoc;
   private final DocIdsWriter docIdsWriter;
 
+  /**
+   * When true, leaf blocks store only doc-ids (no values). Opt-in, single-dimension only; the
+   * default ({@code false}) writes a byte-identical index to the prior format. See {@link
+   * #VERSION_DOC_IDS_ONLY_LEAVES}.
+   */
+  private final boolean docIdsOnly;
+
   public BKDWriter(
       int maxDoc,
       Directory tempDir,
@@ -151,7 +165,34 @@ public class BKDWriter implements Closeable {
         config,
         maxMBSortInHeap,
         totalPointCount,
-        BKDWriter.VERSION_CURRENT);
+        BKDWriter.VERSION_CURRENT,
+        false);
+  }
+
+  /**
+   * Opt-in constructor for the doc-ids-only ("value-free") leaf format. When {@code docIdsOnly} is
+   * true the BKD stores only the matching doc-ids per leaf and omits the packed point values;
+   * range queries are answered as a conservative super-set (boundary leaves emitted whole) which
+   * the caller is expected to re-check exactly against the authoritative value store. Requires
+   * {@code config.numDims() == 1}.
+   */
+  public BKDWriter(
+      int maxDoc,
+      Directory tempDir,
+      String tempFileNamePrefix,
+      BKDConfig config,
+      double maxMBSortInHeap,
+      long totalPointCount,
+      boolean docIdsOnly) {
+    this(
+        maxDoc,
+        tempDir,
+        tempFileNamePrefix,
+        config,
+        maxMBSortInHeap,
+        totalPointCount,
+        BKDWriter.VERSION_CURRENT,
+        docIdsOnly);
   }
 
   /** This ctor should be only used for testing with older versions. */
@@ -163,9 +204,33 @@ public class BKDWriter implements Closeable {
       double maxMBSortInHeap,
       long totalPointCount,
       int version) {
+    this(maxDoc, tempDir, tempFileNamePrefix, config, maxMBSortInHeap, totalPointCount, version, false);
+  }
+
+  private BKDWriter(
+      int maxDoc,
+      Directory tempDir,
+      String tempFileNamePrefix,
+      BKDConfig config,
+      double maxMBSortInHeap,
+      long totalPointCount,
+      int version,
+      boolean docIdsOnly) {
     if (version < VERSION_START || version > VERSION_CURRENT) {
       throw new IllegalArgumentException("Version out of range: " + version);
     }
+    if (docIdsOnly) {
+      if (version < VERSION_DOC_IDS_ONLY_LEAVES) {
+        throw new IllegalArgumentException(
+            "docIdsOnly requires version >= " + VERSION_DOC_IDS_ONLY_LEAVES + " but got " + version);
+      }
+      if (config.numDims() != 1) {
+        throw new IllegalArgumentException(
+            "docIdsOnly is only supported for single-dimension points but got numDims="
+                + config.numDims());
+      }
+    }
+    this.docIdsOnly = docIdsOnly;
     this.version = version;
     verifyParams(maxMBSortInHeap, totalPointCount);
     // We use tracking dir to deal with removing files on exception, so each place that
@@ -841,6 +906,14 @@ public class BKDWriter implements Closeable {
       leafBlockFPs.add(dataOut.getFilePointer());
       checkMaxLeafNodeCount(Math.toIntExact(leafBlockFPs.size()));
 
+      if (docIdsOnly) {
+        // Value-free leaf: sort doc-ids ascending so DocIdsWriter can pick the bitset/continuous
+        // encodings, then write only the doc-id block (no prefixes, no values).
+        Arrays.sort(leafDocs, 0, leafCount);
+        writeLeafBlockDocs(dataOut, leafDocs, 0, leafCount);
+        return;
+      }
+
       // Find per-dim common prefix:
       commonPrefixLengths[0] =
           commonPrefixComparator.compare(
@@ -1301,6 +1374,11 @@ public class BKDWriter implements Closeable {
       long dataStartFP)
       throws IOException {
     CodecUtil.writeHeader(metaOut, CODEC_NAME, version);
+    if (version >= VERSION_DOC_IDS_ONLY_LEAVES) {
+      // One-byte opt-in flag: 1 => leaves store doc-ids only (no values). Written only for
+      // versions that understand it, so older-version writes remain byte-identical.
+      metaOut.writeByte((byte) (docIdsOnly ? 1 : 0));
+    }
     metaOut.writeVInt(config.numDims());
     metaOut.writeVInt(config.numIndexDims());
     metaOut.writeVInt(countPerLeaf);
@@ -1746,25 +1824,35 @@ public class BKDWriter implements Closeable {
       for (int i = from; i < to; ++i) {
         docIDs[i - from] = reader.getDocID(i);
       }
-      // System.out.println("writeLeafBlock pos=" + out.getFilePointer());
-      writeLeafBlockDocs(out, docIDs, 0, count);
+      if (docIdsOnly) {
+        // Value-free leaf: sort doc-ids ascending, write only the doc-id block.
+        Arrays.sort(docIDs, 0, count);
+        writeLeafBlockDocs(out, docIDs, 0, count);
+      } else {
+        // System.out.println("writeLeafBlock pos=" + out.getFilePointer());
+        writeLeafBlockDocs(out, docIDs, 0, count);
 
-      // Write the common prefixes:
-      reader.getValue(from, scratchBytesRef1);
-      System.arraycopy(
-          scratchBytesRef1.bytes, scratchBytesRef1.offset, scratch, 0, config.packedBytesLength());
-      writeCommonPrefixes(out, commonPrefixLengths, scratch);
+        // Write the common prefixes:
+        reader.getValue(from, scratchBytesRef1);
+        System.arraycopy(
+            scratchBytesRef1.bytes,
+            scratchBytesRef1.offset,
+            scratch,
+            0,
+            config.packedBytesLength());
+        writeCommonPrefixes(out, commonPrefixLengths, scratch);
 
-      // Write the full values:
-      IntFunction<BytesRef> packedValues =
-          i -> {
-            reader.getValue(from + i, scratchBytesRef1);
-            return scratchBytesRef1;
-          };
-      assert valuesInOrderAndBounds(
-          config, count, sortedDim, minPackedValue, maxPackedValue, packedValues, docIDs, 0);
-      writeLeafBlockPackedValues(
-          out, commonPrefixLengths, count, sortedDim, packedValues, leafCardinality);
+        // Write the full values:
+        IntFunction<BytesRef> packedValues =
+            i -> {
+              reader.getValue(from + i, scratchBytesRef1);
+              return scratchBytesRef1;
+            };
+        assert valuesInOrderAndBounds(
+            config, count, sortedDim, minPackedValue, maxPackedValue, packedValues, docIDs, 0);
+        writeLeafBlockPackedValues(
+            out, commonPrefixLengths, count, sortedDim, packedValues, leafCardinality);
+      }
     } else {
       // inner node
 
@@ -2002,22 +2090,28 @@ public class BKDWriter implements Closeable {
       for (int i = 0; i < count; i++) {
         docIDs[i] = heapSource.getPackedValueSlice(from + i).docID();
       }
-      writeLeafBlockDocs(out, docIDs, 0, count);
+      if (docIdsOnly) {
+        // Value-free leaf: sort doc-ids ascending, write only the doc-id block.
+        Arrays.sort(docIDs, 0, count);
+        writeLeafBlockDocs(out, docIDs, 0, count);
+      } else {
+        writeLeafBlockDocs(out, docIDs, 0, count);
 
-      // TODO: minor opto: we don't really have to write the actual common prefixes, because
-      // BKDReader on recursing can regenerate it for us
-      // from the index, much like how terms dict does so from the FST:
+        // TODO: minor opto: we don't really have to write the actual common prefixes, because
+        // BKDReader on recursing can regenerate it for us
+        // from the index, much like how terms dict does so from the FST:
 
-      // Write the common prefixes:
-      writeCommonPrefixes(out, commonPrefixLengths, scratch);
+        // Write the common prefixes:
+        writeCommonPrefixes(out, commonPrefixLengths, scratch);
 
-      // Write the full values:
-      IntFunction<BytesRef> packedValues =
-          i -> heapSource.getPackedValueSlice(from + i).packedValue();
-      assert valuesInOrderAndBounds(
-          config, count, sortedDim, minPackedValue, maxPackedValue, packedValues, docIDs, 0);
-      writeLeafBlockPackedValues(
-          out, commonPrefixLengths, count, sortedDim, packedValues, leafCardinality);
+        // Write the full values:
+        IntFunction<BytesRef> packedValues =
+            i -> heapSource.getPackedValueSlice(from + i).packedValue();
+        assert valuesInOrderAndBounds(
+            config, count, sortedDim, minPackedValue, maxPackedValue, packedValues, docIDs, 0);
+        writeLeafBlockPackedValues(
+            out, commonPrefixLengths, count, sortedDim, packedValues, leafCardinality);
+      }
 
     } else {
       // Inner node: partition/recurse
