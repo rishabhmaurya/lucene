@@ -40,6 +40,16 @@ import org.apache.lucene.util.bkd.BKDWriter;
 /** Writes dimensional values */
 public class Lucene90PointsWriter extends PointsWriter {
 
+  /**
+   * Opt-in per-field attribute. When a single-dimension field's {@link FieldInfo} carries this
+   * attribute set to {@code "true"}, its BKD is written in the value-free ("doc-ids only") leaf
+   * format (see {@link org.apache.lucene.util.bkd.BKDWriter#VERSION_DOC_IDS_ONLY_LEAVES}): leaf
+   * blocks store only matching doc-ids and range queries return a conservative super-set the
+   * caller must re-check. Absent or any other value => the standard full-value format (byte
+   * identical to before). Set it via {@code FieldType.putAttribute(...)} at index time.
+   */
+  public static final String DOC_IDS_ONLY_ATTRIBUTE_KEY = "bkdDocIdsOnly";
+
   /** Outputs used to write the BKD tree data files. */
   protected final IndexOutput metaOut, indexOut, dataOut;
 
@@ -146,6 +156,15 @@ public class Lucene90PointsWriter extends PointsWriter {
             fieldInfo.getPointNumBytes(),
             maxPointsInLeafNode);
 
+    boolean docIdsOnly = isDocIdsOnly(fieldInfo);
+    // A value-free field needs the BKD version that understands the doc-ids-only flag, regardless
+    // of the segment's points-format version. Per-field BKD versioning is safe: each field's BKD
+    // writes its own header, and BKDReader reads it back per field.
+    int bkdVersion =
+        docIdsOnly
+            ? BKDWriter.VERSION_DOC_IDS_ONLY_LEAVES
+            : Lucene90PointsFormat.bkdVersion(version);
+
     try (BKDWriter writer =
         new BKDWriter(
             writeState.segmentInfo.maxDoc(),
@@ -154,7 +173,8 @@ public class Lucene90PointsWriter extends PointsWriter {
             config,
             maxMBSortInHeap,
             values.size(),
-            Lucene90PointsFormat.bkdVersion(version))) {
+            bkdVersion,
+            docIdsOnly)) {
 
       if (values instanceof MutablePointTree) {
         IORunnable finalizer =
@@ -194,6 +214,16 @@ public class Lucene90PointsWriter extends PointsWriter {
     }
   }
 
+  /**
+   * Whether this field opted in to the value-free leaf format. Only single-dimension fields may
+   * opt in (the BKD doc-ids-only mode is 1-D only); a multi-dim field carrying the attribute is
+   * ignored here and falls back to the standard format.
+   */
+  static boolean isDocIdsOnly(FieldInfo fieldInfo) {
+    return fieldInfo.getPointDimensionCount() == 1
+        && Boolean.parseBoolean(fieldInfo.getAttribute(DOC_IDS_ONLY_ATTRIBUTE_KEY));
+  }
+
   @Override
   public void merge(MergeState mergeState) throws IOException {
     /*
@@ -211,6 +241,22 @@ public class Lucene90PointsWriter extends PointsWriter {
     for (PointsReader reader : mergeState.pointsReaders) {
       if (reader != null) {
         reader.checkIntegrity();
+      }
+    }
+
+    // A value-free ("doc-ids only") field stores no per-point values, so neither the bulk merge
+    // (BKDWriter.merge, which reads source values to merge-sort) nor the base re-index merge
+    // (which visits docID+packedValue) can reconstruct it. Detect it and fail loud rather than
+    // silently produce a corrupt or empty segment. Callers that use this format are expected to
+    // write segments that are not subsequently value-merged (e.g. one segment per data file).
+    for (FieldInfo fieldInfo : mergeState.mergeFieldInfos) {
+      if (fieldInfo.getPointDimensionCount() != 0 && isDocIdsOnly(fieldInfo)) {
+        throw new IllegalStateException(
+            "Cannot merge points field \""
+                + fieldInfo.name
+                + "\": it uses the value-free (doc-ids only) BKD format, which stores no point "
+                + "values and therefore cannot be merged. Avoid merging segments containing this "
+                + "field, or rebuild it from the authoritative value source.");
       }
     }
 

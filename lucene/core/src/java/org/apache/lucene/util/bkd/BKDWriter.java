@@ -207,7 +207,8 @@ public class BKDWriter implements Closeable {
     this(maxDoc, tempDir, tempFileNamePrefix, config, maxMBSortInHeap, totalPointCount, version, false);
   }
 
-  private BKDWriter(
+  /** Full constructor: explicit version and value-free (doc-ids-only) opt-in. */
+  public BKDWriter(
       int maxDoc,
       Directory tempDir,
       String tempFileNamePrefix,

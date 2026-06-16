@@ -64,6 +64,10 @@ public final class Lucene90PointsFormat extends PointsFormat {
   static final int VERSION_BKD_VECTORIZED_BPV24 = 1;
   static final int VERSION_CURRENT = VERSION_BKD_VECTORIZED_BPV24;
 
+  // NOTE: the opt-in "doc-ids only" (value-free) leaf format does NOT need a points-format version
+  // bump: each field's BKD writes and reads its own version header, so a value-free field uses
+  // BKDWriter.VERSION_DOC_IDS_ONLY_LEAVES per field (see Lucene90PointsWriter#writeField) while the
+  // segment's points format stays at VERSION_CURRENT.
   private static final Map<Integer, Integer> VERSION_TO_BKD_VERSION =
       Map.of(
           VERSION_START, BKDWriter.VERSION_META_FILE,

@@ -2994,11 +2994,16 @@ public final class CheckIndex implements Closeable {
     private final int bytesPerDim;
     private final ByteArrayComparator comparator;
     private final String fieldName;
+    // When the field uses the value-free ("doc-ids only") BKD format, leaves carry no packed
+    // values; the codec legitimately calls visit(int docID) and crossing cells are emitted whole.
+    // In that mode we verify doc-id bookkeeping but skip all per-value/value-order checks.
+    private final boolean docIdsOnly;
 
     /** Sole constructor */
     public VerifyPointsVisitor(String fieldName, int maxDoc, PointValues values)
         throws IOException {
       this.fieldName = fieldName;
+      this.docIdsOnly = unwrapDocIdsOnly(values);
       numDataDims = values.getNumDimensions();
       numIndexDims = values.getNumIndexDimensions();
       bytesPerDim = values.getBytesPerDimension();
@@ -3080,6 +3085,12 @@ public final class CheckIndex implements Closeable {
 
     @Override
     public void visit(int docID) {
+      if (docIdsOnly) {
+        // Value-free format: no packed value is available; just account for the doc.
+        pointCountSeen++;
+        docsSeen.set(docID);
+        return;
+      }
       throw new CheckIndexException(
           "codec called IntersectVisitor.visit without a packed value for docID=" + docID);
     }
@@ -3265,6 +3276,11 @@ public final class CheckIndex implements Closeable {
                 + fieldName
                 + "\"");
       }
+    }
+
+    /** Whether the underlying points use the value-free (doc-ids only) BKD format. */
+    private static boolean unwrapDocIdsOnly(PointValues values) {
+      return values instanceof org.apache.lucene.util.bkd.BKDReader bkd && bkd.isDocIdsOnly();
     }
   }
 

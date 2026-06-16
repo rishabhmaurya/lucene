@@ -1057,6 +1057,15 @@ public class BKDReader extends PointValues {
     return docCount;
   }
 
+  /**
+   * Whether this BKD stores only doc-ids in its leaves (the value-free format). When true, range
+   * queries return a conservative super-set and the caller must re-check exactly against the
+   * authoritative value store. See {@link BKDWriter#VERSION_DOC_IDS_ONLY_LEAVES}.
+   */
+  public boolean isDocIdsOnly() {
+    return docIdsOnly;
+  }
+
   /** Reusable {@link DocIdSetIterator} to handle low cardinality leaves. */
   private static class BKDReaderDocIDSetIterator extends AbstractDocIdSetIterator {
 
