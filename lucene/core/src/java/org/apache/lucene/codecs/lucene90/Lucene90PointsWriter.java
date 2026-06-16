@@ -244,23 +244,33 @@ public class Lucene90PointsWriter extends PointsWriter {
       }
     }
 
-    // A value-free ("doc-ids only") field stores no per-point values, so neither the bulk merge
-    // (BKDWriter.merge, which reads source values to merge-sort) nor the base re-index merge
-    // (which visits docID+packedValue) can reconstruct it. Detect it and fail loud rather than
-    // silently produce a corrupt or empty segment. Callers that use this format are expected to
-    // write segments that are not subsequently value-merged (e.g. one segment per data file).
+    // A value-free ("doc-ids only") field stores no per-point values in its leaves, so the normal
+    // merge paths (bulk BKDWriter.merge / base re-index, both of which read source point values)
+    // cannot reconstruct its BKD. Instead we rebuild it from the field's SortedNumericDocValues,
+    // which are co-written at index time precisely as the merge-survival value source and merge
+    // natively. Handle those fields here and skip them in the normal point-merge loop below.
+    java.util.Set<String> docIdsOnlyHandled = new java.util.HashSet<>();
     for (FieldInfo fieldInfo : mergeState.mergeFieldInfos) {
       if (fieldInfo.getPointDimensionCount() != 0 && isDocIdsOnly(fieldInfo)) {
-        throw new IllegalStateException(
-            "Cannot merge points field \""
-                + fieldInfo.name
-                + "\": it uses the value-free (doc-ids only) BKD format, which stores no point "
-                + "values and therefore cannot be merged. Avoid merging segments containing this "
-                + "field, or rebuild it from the authoritative value source.");
+        if (fieldInfo.getPointDimensionCount() != 1 || fieldInfo.getPointNumBytes() != Long.BYTES) {
+          throw new IllegalStateException(
+              "Value-free (doc-ids only) BKD merge supports only single-dimension 8-byte points; "
+                  + "field \""
+                  + fieldInfo.name
+                  + "\" has dims="
+                  + fieldInfo.getPointDimensionCount()
+                  + " bytesPerDim="
+                  + fieldInfo.getPointNumBytes());
+        }
+        mergeDocIdsOnlyFromDocValues(fieldInfo, mergeState);
+        docIdsOnlyHandled.add(fieldInfo.name);
       }
     }
 
     for (FieldInfo fieldInfo : mergeState.mergeFieldInfos) {
+      if (docIdsOnlyHandled.contains(fieldInfo.name)) {
+        continue; // already rebuilt from doc-values above
+      }
       if (fieldInfo.getPointDimensionCount() != 0) {
         if (fieldInfo.getPointDimensionCount() == 1) {
 
@@ -341,6 +351,86 @@ public class Lucene90PointsWriter extends PointsWriter {
     }
 
     finish();
+  }
+
+  /**
+   * Rebuilds a value-free ("doc-ids only") BKD for the merged segment from the field's
+   * {@link org.apache.lucene.index.SortedNumericDocValues} across all source segments. The
+   * value-free leaves themselves carry no values, so they cannot be merged directly; the
+   * co-written doc-values (see the indexer's numeric field factory) are the merge-survival value
+   * source. Each source doc's value is read in merged-docID order (applying the per-segment doc
+   * map and live docs), fed to a fresh {@code docIdsOnly} {@link BKDWriter}, and the resulting BKD
+   * replaces the field's points in the merged segment.
+   */
+  private void mergeDocIdsOnlyFromDocValues(FieldInfo fieldInfo, MergeState mergeState)
+      throws IOException {
+    BKDConfig config =
+        new BKDConfig(
+            fieldInfo.getPointDimensionCount(),
+            fieldInfo.getPointIndexDimensionCount(),
+            fieldInfo.getPointNumBytes(),
+            maxPointsInLeafNode);
+
+    int maxDoc = writeState.segmentInfo.maxDoc();
+    // Collect (mergedDocID, value) for every live doc that has the field, then add in docID order
+    // (BKDWriter.add for 1-D requires ascending value? No — add() buffers and sorts; but the
+    // OneDimensionBKDWriter via writeField needs sorted input. We use the buffering add() path
+    // which sorts internally, so insertion order is free.)
+    try (BKDWriter writer =
+        new BKDWriter(
+            maxDoc,
+            writeState.directory,
+            writeState.segmentInfo.name,
+            config,
+            maxMBSortInHeap,
+            (long) maxDoc,
+            BKDWriter.VERSION_DOC_IDS_ONLY_LEAVES,
+            true)) {
+
+      byte[] scratch = new byte[Long.BYTES];
+      boolean any = false;
+      for (int i = 0; i < mergeState.docValuesProducers.length; i++) {
+        org.apache.lucene.codecs.DocValuesProducer dvp = mergeState.docValuesProducers[i];
+        if (dvp == null) {
+          continue;
+        }
+        FieldInfos readerFieldInfos = mergeState.fieldInfos[i];
+        FieldInfo readerFieldInfo = readerFieldInfos.fieldInfo(fieldInfo.name);
+        if (readerFieldInfo == null
+            || readerFieldInfo.getDocValuesType() != org.apache.lucene.index.DocValuesType.SORTED_NUMERIC) {
+          throw new IllegalStateException(
+              "Value-free BKD field \""
+                  + fieldInfo.name
+                  + "\" requires co-written SORTED_NUMERIC doc-values to merge, but source segment "
+                  + i
+                  + " has docValuesType="
+                  + (readerFieldInfo == null ? "<absent>" : readerFieldInfo.getDocValuesType()));
+        }
+        org.apache.lucene.index.SortedNumericDocValues dv = dvp.getSortedNumeric(readerFieldInfo);
+        MergeState.DocMap docMap = mergeState.docMaps[i];
+        int docID;
+        while ((docID = dv.nextDoc()) != org.apache.lucene.search.DocIdSetIterator.NO_MORE_DOCS) {
+          int newDocID = docMap.get(docID);
+          if (newDocID == -1) {
+            continue; // deleted in the merged view
+          }
+          // A value-free numeric point is single-valued; take the first value.
+          long value = dv.nextValue();
+          org.apache.lucene.util.NumericUtils.longToSortableBytes(value, scratch, 0);
+          writer.add(scratch, newDocID);
+          any = true;
+        }
+      }
+
+      if (any == false) {
+        return; // no live docs with this field; nothing to write
+      }
+      IORunnable finalizer = writer.finish(metaOut, indexOut, dataOut);
+      if (finalizer != null) {
+        metaOut.writeInt(fieldInfo.number);
+        finalizer.run();
+      }
+    }
   }
 
   @Override

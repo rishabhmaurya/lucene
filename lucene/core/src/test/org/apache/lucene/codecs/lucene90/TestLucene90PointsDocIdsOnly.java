@@ -22,6 +22,7 @@ import org.apache.lucene.document.Document;
 import org.apache.lucene.document.Field;
 import org.apache.lucene.document.FieldType;
 import org.apache.lucene.document.LongPoint;
+import org.apache.lucene.document.SortedNumericDocValuesField;
 import org.apache.lucene.index.DirectoryReader;
 import org.apache.lucene.index.IndexWriter;
 import org.apache.lucene.index.IndexWriterConfig;
@@ -184,6 +185,75 @@ public class TestLucene90PointsDocIdsOnly extends LuceneTestCase {
           BitSet exact = new BitSet();
           pv.intersect(rangeVisitor(exact, qMin, qMax, valuesByDoc, true));
           assertEquals("residual-checked result equals truth", truth, exact);
+        }
+      }
+    }
+  }
+
+  /**
+   * Value-free segments must SURVIVE a merge by rebuilding the BKD from co-written
+   * SortedNumericDocValues. Index three segments (each point + co-written DV), forceMerge to one,
+   * then assert the merged single segment is still a value-free BKD and prunes correctly.
+   */
+  public void testValueFreeMergeRebuildsFromDocValues() throws Exception {
+    final int perSeg = 500;
+    final int segs = 3;
+    final int n = perSeg * segs;
+    long[] valuesByDoc = new long[n];
+    FieldType type = docIdsOnlyLongType();
+
+    try (Directory dir = newDirectory()) {
+      IndexWriterConfig iwc =
+          new IndexWriterConfig().setCodec(org.apache.lucene.codecs.Codec.forName("Lucene104"));
+      // Allow merges (we explicitly forceMerge below); keep docID == insertion order across the
+      // run by flushing one segment per batch via commit().
+      iwc.setUseCompoundFile(false);
+      try (IndexWriter w = new IndexWriter(dir, iwc)) {
+        int docId = 0;
+        for (int s = 0; s < segs; s++) {
+          for (int i = 0; i < perSeg; i++) {
+            long v = random().nextInt(1000);
+            valuesByDoc[docId++] = v;
+            Document doc = new Document();
+            doc.add(new Field("val", pack(v), type));
+            // Co-written merge-survival value source (mirrors NumericPointFieldFactory).
+            doc.add(new SortedNumericDocValuesField("val", v));
+            w.addDocument(doc);
+          }
+          w.commit(); // new segment per batch
+        }
+        w.forceMerge(1); // <- triggers the value-free BKD rebuild-from-DV merge path
+      }
+
+      try (DirectoryReader reader = DirectoryReader.open(dir)) {
+        assertEquals("expected a single merged segment", 1, reader.leaves().size());
+        LeafReaderContext ctx = reader.leaves().get(0);
+        PointValues pv = ctx.reader().getPointValues("val");
+        assertNotNull("merged segment must still have the points field", pv);
+        assertTrue("merged segment must still be value-free", unwrapDocIdsOnly(pv));
+        assertEquals("merged segment must retain all docs", n, ctx.reader().maxDoc());
+
+        for (int iter = 0; iter < 40; iter++) {
+          int a = random().nextInt(1000);
+          int b = random().nextInt(1000);
+          long qMin = Math.min(a, b);
+          long qMax = Math.max(a, b);
+          BitSet truth = new BitSet();
+          for (int d = 0; d < n; d++) {
+            if (valuesByDoc[d] >= qMin && valuesByDoc[d] <= qMax) {
+              truth.set(d);
+            }
+          }
+          // Super-set (no true match dropped after the merge rebuild).
+          BitSet raw = new BitSet();
+          pv.intersect(rangeVisitor(raw, qMin, qMax, valuesByDoc, false));
+          for (int d = truth.nextSetBit(0); d >= 0; d = truth.nextSetBit(d + 1)) {
+            assertTrue("merged value-free BKD dropped a true match docID=" + d, raw.get(d));
+          }
+          // Exact after residual re-check.
+          BitSet exact = new BitSet();
+          pv.intersect(rangeVisitor(exact, qMin, qMax, valuesByDoc, true));
+          assertEquals("merged residual-checked result equals truth", truth, exact);
         }
       }
     }
