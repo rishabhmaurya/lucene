@@ -259,6 +259,87 @@ public class TestLucene90PointsDocIdsOnly extends LuceneTestCase {
     }
   }
 
+  /**
+   * The cluster-reproducing case: when the index has an IndexSort, merge routes points through
+   * {@code SortingCodecReader} → base {@code PointsWriter.mergeOneField}, whose visitor calls
+   * {@code visit(int docID)} and previously threw on a value-free leaf ("cannot complete
+   * forceMerge"). Verifies the {@code mergeOneField} override rebuilds the value-free BKD from
+   * doc-values even under IndexSort, and the merged segment prunes correctly in the SORTED docID
+   * space.
+   */
+  public void testValueFreeMergeUnderIndexSort() throws Exception {
+    final int perSeg = 400;
+    final int segs = 3;
+    final int n = perSeg * segs;
+    FieldType type = docIdsOnlyLongType();
+
+    try (Directory dir = newDirectory()) {
+      IndexWriterConfig iwc =
+          new IndexWriterConfig().setCodec(org.apache.lucene.codecs.Codec.forName("Lucene104"));
+      iwc.setUseCompoundFile(false);
+      // IndexSort by a separate long DV field (mirrors Mustang's index.sort.field) → forces the
+      // SortingCodecReader merge path that hit the bug on the cluster.
+      iwc.setIndexSort(
+          new org.apache.lucene.search.Sort(
+              new org.apache.lucene.search.SortedNumericSortField(
+                  "sort_val", org.apache.lucene.search.SortField.Type.LONG, true)));
+
+      // value -> we recover the post-merge value per doc via the "val" DV, so track by a stable key.
+      // After an index sort docIDs are reordered, so validate against the merged segment's own DV.
+      try (IndexWriter w = new IndexWriter(dir, iwc)) {
+        int k = 0;
+        for (int s = 0; s < segs; s++) {
+          for (int i = 0; i < perSeg; i++) {
+            long v = random().nextInt(1000);
+            Document doc = new Document();
+            doc.add(new Field("val", pack(v), type));
+            doc.add(new SortedNumericDocValuesField("val", v)); // merge-survival source
+            doc.add(new SortedNumericDocValuesField("sort_val", random().nextInt(100000))); // sort key
+            w.addDocument(doc);
+            k++;
+          }
+          w.commit();
+        }
+        w.forceMerge(1); // SortingCodecReader merge path
+      }
+
+      try (DirectoryReader reader = DirectoryReader.open(dir)) {
+        assertEquals("expected one merged segment", 1, reader.leaves().size());
+        LeafReaderContext ctx = reader.leaves().get(0);
+        PointValues pv = ctx.reader().getPointValues("val");
+        assertNotNull("merged value-free field must survive IndexSort merge", pv);
+        assertTrue("merged segment must still be value-free", unwrapDocIdsOnly(pv));
+        assertEquals("all docs retained", n, ctx.reader().maxDoc());
+
+        // Recover the post-merge value per (sorted) docID from the merged segment's own DV.
+        long[] mergedVals = new long[n];
+        org.apache.lucene.index.SortedNumericDocValues dv =
+            ctx.reader().getSortedNumericDocValues("val");
+        int d;
+        while ((d = dv.nextDoc()) != org.apache.lucene.search.DocIdSetIterator.NO_MORE_DOCS) {
+          mergedVals[d] = dv.nextValue();
+        }
+
+        for (int iter = 0; iter < 30; iter++) {
+          int a = random().nextInt(1000), b = random().nextInt(1000);
+          long qMin = Math.min(a, b), qMax = Math.max(a, b);
+          BitSet truth = new BitSet();
+          for (int x = 0; x < n; x++) {
+            if (mergedVals[x] >= qMin && mergedVals[x] <= qMax) truth.set(x);
+          }
+          BitSet raw = new BitSet();
+          pv.intersect(rangeVisitor(raw, qMin, qMax, mergedVals, false));
+          for (int x = truth.nextSetBit(0); x >= 0; x = truth.nextSetBit(x + 1)) {
+            assertTrue("sorted-merge value-free BKD dropped match docID=" + x, raw.get(x));
+          }
+          BitSet exact = new BitSet();
+          pv.intersect(rangeVisitor(exact, qMin, qMax, mergedVals, true));
+          assertEquals("sorted-merge residual result equals truth", truth, exact);
+        }
+      }
+    }
+  }
+
   /** Unwrap any test-framework wrappers and report whether the underlying BKD is value-free. */
   private static boolean unwrapDocIdsOnly(PointValues pv) {
     if (pv instanceof org.apache.lucene.tests.index.AssertingLeafReader.AssertingPointValues a) {

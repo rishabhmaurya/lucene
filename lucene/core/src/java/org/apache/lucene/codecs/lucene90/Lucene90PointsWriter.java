@@ -224,6 +224,22 @@ public class Lucene90PointsWriter extends PointsWriter {
         && Boolean.parseBoolean(fieldInfo.getAttribute(DOC_IDS_ONLY_ATTRIBUTE_KEY));
   }
 
+  /**
+   * Intercepts the per-field merge so a value-free ("doc-ids only") field is rebuilt from its
+   * co-written SortedNumericDocValues rather than from its (value-less) points. This is the entry
+   * the IndexSort / {@code SortingCodecReader} path uses (base {@code PointsWriter.merge} →
+   * {@code mergeOneField}); without it the sorting merge visitor calls {@code visit(int docID)} on
+   * a value-free leaf and the standard guard throws "this writer hit an unrecoverable error".
+   */
+  @Override
+  protected void mergeOneField(MergeState mergeState, FieldInfo fieldInfo) throws IOException {
+    if (fieldInfo.getPointDimensionCount() != 0 && isDocIdsOnly(fieldInfo)) {
+      mergeDocIdsOnlyFromDocValues(fieldInfo, mergeState);
+      return;
+    }
+    super.mergeOneField(mergeState, fieldInfo);
+  }
+
   @Override
   public void merge(MergeState mergeState) throws IOException {
     /*
@@ -233,7 +249,9 @@ public class Lucene90PointsWriter extends PointsWriter {
      */
     for (PointsReader reader : mergeState.pointsReaders) {
       if (reader instanceof Lucene90PointsReader == false) {
-        // We can only bulk merge when all to-be-merged segments use our format:
+        // We can only bulk merge when all to-be-merged segments use our format. The base
+        // PointsWriter.merge dispatches per field to mergeOneField (overridden above), which
+        // handles value-free fields via doc-values rebuild — so this path is value-free-safe.
         super.merge(mergeState);
         return;
       }
